@@ -12,8 +12,14 @@ port exitApp : Float -> Cmd msg
 port externalStop : (() -> msg) -> Sub msg
 
 
+type ServerRunningStatus
+    = Running
+    | NotRunning
+
+
 type alias Model =
-    { serviceCount : Int
+    { status : ServerRunningStatus
+    , serviceCount : Int
     , pgProxyModel : PGProxy.Model Msg
     , pgProxyStartMsg : PGProxy.Msg
     , pgProxyStopMsg : PGProxy.Msg
@@ -38,6 +44,7 @@ type Msg
     | PGProxyStarted
     | PGProxyStopped
     | PGError String
+    | PGLog String
     | PGProxyModule PGProxy.Msg
 
 
@@ -70,9 +77,10 @@ initModel : Model
 initModel =
     let
         ( pgProxyModel, pgProxyStartMsg, pgProxyStopMsg ) =
-            PGProxy.initModel PGError PGProxyStarted PGProxyStopped authenticate wsPort
+            PGProxy.initModel PGError PGLog PGProxyStarted PGProxyStopped authenticate wsPort
     in
-        { serviceCount = 1
+        { status = NotRunning
+        , serviceCount = 1
         , pgProxyModel = pgProxyModel
         , pgProxyStartMsg = pgProxyStartMsg
         , pgProxyStopMsg = pgProxyStopMsg
@@ -127,11 +135,11 @@ doAppMsgs model msgs serviceTagger serviceCmd =
         finalModel ! (Cmd.map serviceTagger serviceCmd :: appCmds)
 
 
-updatePGProxyModel : (PGProxy.Model Msg -> ( ( PGProxy.Model Msg, Cmd PGProxy.Msg ), List Msg )) -> Model -> ( Model, Cmd Msg )
-updatePGProxyModel f model =
+updatePGProxy : PGProxy.Msg -> Model -> ( Model, Cmd Msg )
+updatePGProxy msg model =
     let
         ( ( newPGProxyModel, pgProxyCmd ), msgs ) =
-            f model.pgProxyModel
+            PGProxy.update msg model.pgProxyModel
     in
         doAppMsgs { model | pgProxyModel = newPGProxyModel } msgs PGProxyModule pgProxyCmd
 
@@ -141,10 +149,10 @@ startStopServices model serviceUpdates =
     let
         ( newModel, cmds ) =
             List.foldl
-                (\f ( model, cmds ) ->
+                (\updateService ( model, cmds ) ->
                     let
                         ( newModel, cmd ) =
-                            f model
+                            updateService model
                     in
                         ( newModel, cmd :: cmds )
                 )
@@ -157,14 +165,14 @@ startStopServices model serviceUpdates =
 startServices : Model -> ( Model, Cmd Msg )
 startServices model =
     startStopServices model
-        [ updatePGProxyModel <| PGProxy.update model.pgProxyStartMsg
+        [ updatePGProxy model.pgProxyStartMsg
         ]
 
 
 stopServices : Model -> ( Model, Cmd Msg )
 stopServices model =
     startStopServices model
-        [ updatePGProxyModel <| PGProxy.update model.pgProxyStopMsg
+        [ updatePGProxy model.pgProxyStopMsg
         ]
 
 
@@ -186,16 +194,19 @@ update msg model =
                 l =
                     Debug.log "ServerError" ( wsPort, error )
             in
-                model ! []
+                model ! [ exitApp -1 ]
 
         ServerStatus ( wsPort, status ) ->
             let
                 l =
                     Debug.log "ServerStatus" ( wsPort, status )
+
+                newModel =
+                    { model | status = Running }
             in
                 case status of
                     Started ->
-                        startServices model
+                        startServices newModel
 
                     Stopped ->
                         ( model, exitApp 1 )
@@ -228,10 +239,29 @@ update msg model =
             in
                 model ! []
 
+        PGLog message ->
+            let
+                l =
+                    Debug.log "PGLog" message
+            in
+                model ! []
+
         PGProxyModule msg ->
-            updatePGProxyModel (PGProxy.update msg) model
+            updatePGProxy msg model
 
 
 subscriptions : Model -> Sub Msg
 subscriptions model =
-    externalStop StopServer
+    let
+        stopServer =
+            externalStop StopServer
+
+        pgProxySubs =
+            Sub.map PGProxyModule <| PGProxy.subscriptions model.pgProxyModel
+    in
+        case model.status of
+            Running ->
+                Sub.batch [ stopServer, pgProxySubs ]
+
+            NotRunning ->
+                stopServer
