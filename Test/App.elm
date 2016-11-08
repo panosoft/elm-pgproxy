@@ -58,16 +58,6 @@ type Msg
     flip Maybe.map
 
 
-(///) : Result err value -> (err -> value) -> value
-(///) result f =
-    case result of
-        Ok value ->
-            value
-
-        Err err ->
-            f err
-
-
 authenticate : SessionId -> Bool
 authenticate _ =
     True
