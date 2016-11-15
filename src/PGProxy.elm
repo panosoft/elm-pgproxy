@@ -7,6 +7,14 @@ module PGProxy
         , Msg
         )
 
+{-| Postgres Proxy
+
+This is a proxy for Postgres Effects Manager on the client.
+
+@docs initModel, update, subscriptions, Model, Msg
+
+-}
+
 import String
 import Time exposing (Time)
 import Process
@@ -48,6 +56,8 @@ type alias ListenDict =
     Dict ( ClientId, ListenChannel ) (Sub Msg)
 
 
+{-| Model
+-}
 type alias Model msg =
     { authenticate : SessionId -> Bool
     , wsPort : WSPort
@@ -130,6 +140,16 @@ log model message =
     model.logTagger message
 
 
+{-| Initialize the PGProxy's model
+
+    Usage:
+        PGProxy.initModel PGError PGLog PGProxyStarted PGProxyStopped authenticate wsPort
+
+    where:
+        PGError, PGLog, PGProxyStarted and PGProxyStopped are your application messages
+        authenticate is a function that takes a sessionId and authenticates that the session is valid
+        wsPort is the Websocket Port to Listen on. The path is '/pgproxy'
+-}
 initModel : (String -> msg) -> (String -> msg) -> msg -> msg -> (SessionId -> Bool) -> WSPort -> ( Model msg, Msg, Msg )
 initModel errorTagger logTagger startedMsg stoppedMsg authenticate wsPort =
     ( { authenticate = authenticate
@@ -284,6 +304,8 @@ delayCmd msg delay =
     Task.perform (\_ -> Nop) (\_ -> msg) <| Process.sleep delay
 
 
+{-| PGProxy Msgs -
+-}
 type Msg
     = Nop
     | Start
@@ -310,6 +332,8 @@ type Msg
     | InternalDisconnected ClientId ConnectionId
 
 
+{-| PGProxy update
+-}
 update : Msg -> Model msg -> ( ( Model msg, Cmd Msg ), List msg )
 update msg model =
     let
@@ -465,6 +489,16 @@ update msg model =
                 ( respondUnsolicited "notification" message "listen" clientId model, [] )
 
 
+getSessionId : String -> SessionId
+getSessionId request =
+    case JD.decodeString ("sessionId" := string) request of
+        Ok sessionId ->
+            toString sessionId
+
+        Err _ ->
+            "Missing session Id"
+
+
 handleRequest : Model msg -> ClientId -> String -> ProxyRequest -> ClientState -> ( Model msg, Cmd Msg )
 handleRequest model clientId json request clientState =
     let
@@ -525,6 +559,8 @@ handleRequest model clientId json request clientState =
                         respond clientId model <| Debug.crash "Unknown request: " ++ json ++ " Error: " ++ error
 
 
+{-| subscriptions
+-}
 subscriptions : Model msg -> Sub Msg
 subscriptions model =
     case model.running of
