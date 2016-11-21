@@ -357,14 +357,14 @@ update msg model =
                 ( { model | running = Running } ! [], [ model.startedMsg ] )
 
             Stop ->
-                ( model ! [ delayCmd Stopping 5000 ], [] )
+                ( { model | running = NotRunning } ! [ delayCmd Stopping 5000 ], [] )
 
             Stopping ->
                 let
                     newModel =
                         List.foldl (\clientId model -> removeClient clientId model) model <| Dict.keys model.clients
                 in
-                    ( { newModel | running = NotRunning } ! [], [ model.stoppedMsg ] )
+                    ( newModel ! [], [ model.stoppedMsg ] )
 
             ConnectionStatus ( wsPort, clientId, ipAddress, status ) ->
                 let
