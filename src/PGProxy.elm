@@ -308,7 +308,7 @@ type Msg
     = Nop
     | Start
     | Stop
-    | Stopping
+    | DelayedStop
     | ConnectionStatus ( WSPort, ClientId, IPAddress, ConnectionStatus )
     | ListenError ( WSPort, Path, String )
     | WSMessage ( ClientId, QueryString, String )
@@ -355,9 +355,9 @@ update msg model =
                 ( { model | running = Running } ! [], [ model.startedMsg ] )
 
             Stop ->
-                ( { model | running = NotRunning } ! [ delayCmd Stopping 5000 ], [] )
+                ( { model | running = NotRunning } ! [ delayCmd DelayedStop 5000 ], [] )
 
-            Stopping ->
+            DelayedStop ->
                 let
                     newModel =
                         List.foldl (\clientId model -> removeClient clientId model) model <| Dict.keys model.clients
