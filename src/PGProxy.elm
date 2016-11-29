@@ -56,13 +56,21 @@ type alias ListenDict =
     Dict ( ClientId, ListenChannel ) (Sub Msg)
 
 
+type alias ErrorTagger msg =
+    String -> msg
+
+
+type alias LogTagger msg =
+    String -> msg
+
+
 {-| Model
 -}
 type alias Model msg =
     { authenticate : SessionId -> Bool
     , wsPort : WSPort
-    , errorTagger : String -> msg
-    , logTagger : String -> msg
+    , errorTagger : ErrorTagger msg
+    , logTagger : LogTagger msg
     , startedMsg : msg
     , stoppedMsg : msg
     , running : ServiceRunningStatus
@@ -135,11 +143,6 @@ jsonStringEscape string =
             |> replace "\"" "\\\""
 
 
-log : Model msg -> String -> msg
-log model message =
-    model.logTagger message
-
-
 {-| Initialize the PGProxy's model
 
     Usage:
@@ -150,7 +153,7 @@ log model message =
         authenticate is a function that takes a sessionId and authenticates that the session is valid
         wsPort is the Websocket Port to Listen on. The path is '/pgproxy'
 -}
-initModel : (String -> msg) -> (String -> msg) -> msg -> msg -> (SessionId -> Bool) -> WSPort -> ( Model msg, Msg, Msg )
+initModel : ErrorTagger msg -> LogTagger msg -> msg -> msg -> (SessionId -> Bool) -> WSPort -> ( Model msg, Msg, Msg )
 initModel errorTagger logTagger startedMsg stoppedMsg authenticate wsPort =
     ( { authenticate = authenticate
       , wsPort = wsPort
@@ -252,12 +255,7 @@ respondMessage maybeSuccess unsolicited maybeKeyValuePair keysFormatted type_ cl
                     ""
 
         typeMessage =
-            case unsolicited of
-                False ->
-                    ", \"type\": \"" ++ type_ ++ "\""
-
-                True ->
-                    ""
+            ", \"type\": \"" ++ type_ ++ "\""
 
         successMessage success =
             ", \"success\": "
@@ -369,7 +367,7 @@ update msg model =
             ConnectionStatus ( wsPort, clientId, ipAddress, status ) ->
                 let
                     logCmd =
-                        log model <| String.join " " [ toString status, "from ipAddress:", ipAddress, " on port:", toString wsPort, "for clientId:", toString clientId ]
+                        model.logTagger <| String.join " " [ toString status, "from ipAddress:", ipAddress, " on port:", toString wsPort, "for clientId:", toString clientId ]
                 in
                     ( (case status of
                         Connected ->
@@ -393,10 +391,10 @@ update msg model =
                     )
 
             InternalDisconnectError clientId ( connectionId, error ) ->
-                ( model ! [], [ log model <| "Internal Disconnect Error: " ++ toString ( clientId, connectionId, error ) ] )
+                ( model ! [], [ model.errorTagger <| "Internal Disconnect Error: " ++ toString ( clientId, connectionId, error ) ] )
 
             InternalDisconnected clientId connectionId ->
-                ( model ! [], [ log model <| "Internal Disconnect Complete for clientId" ++ toString clientId ] )
+                ( model ! [], [ model.logTagger <| "Internal Disconnect Complete for clientId" ++ toString clientId ] )
 
             ListenError ( wsPort, path, error ) ->
                 ( { model | listenError = True } ! [], [ model.errorTagger ("Unable to listen to websocket on port: " ++ (toString model.wsPort) ++ " for path: " ++ path ++ " error: " ++ error) ] )
@@ -490,10 +488,10 @@ update msg model =
 
 
 getSessionId : String -> SessionId
-getSessionId request =
-    case JD.decodeString ("sessionId" := string) request of
+getSessionId json =
+    case JD.decodeString ("sessionId" := string) json of
         Ok sessionId ->
-            toString sessionId
+            sessionId
 
         Err _ ->
             "Missing session Id"
@@ -512,51 +510,59 @@ handleRequest model clientId json request clientState =
 
                 _ ->
                     ( model, cmd )
+
+        handle running =
+            case running of
+                NotRunning ->
+                    model ! []
+
+                Running ->
+                    case request of
+                        Connect connectionRequest ->
+                            ( model, Postgres.connect (PGConnectError clientId) (PGConnected clientId) (PGConnectionLost clientId) pgConnectTimeout connectionRequest.host connectionRequest.port_ connectionRequest.database connectionRequest.user connectionRequest.password )
+
+                        Disconnect disconnectionRequest ->
+                            withConnectionId clientId model "disconnect" <| Postgres.disconnect (PGDisconnectError clientId) (PGDisconnected clientId) connectionId disconnectionRequest.discardConnection
+
+                        Query queryRequest ->
+                            withConnectionId clientId model "query" <| Postgres.query (PGQueryError "query" clientId) (PGQuerySuccess "query" clientId) connectionId queryRequest.sql queryRequest.recordCount
+
+                        MoreQueryResults moreQueryResultsRequest ->
+                            withConnectionId clientId model "moreQueryResults" <| Postgres.moreQueryResults (PGQueryError "moreQueryResults" clientId) (PGQuerySuccess "moreQueryResults" clientId) connectionId
+
+                        ExecuteSql executeSqlRequest ->
+                            withConnectionId clientId model "executeSql" <| Postgres.executeSql (PGExecuteSqlError clientId) (PGExecuteSqlSuccess clientId) connectionId executeSqlRequest.sql
+
+                        Listen listenRequest ->
+                            let
+                                sub =
+                                    Postgres.listen (PGListenError clientId ListenType) (PGListenSuccess clientId) (PGListenEvent clientId) connectionId listenRequest.channel
+
+                                ( finalModel, cmd ) =
+                                    Dict.get ( clientId, listenRequest.channel ) model.listens
+                                        |?> (\_ -> respondError ("Listen already exists for Channel: " ++ listenRequest.channel) "listen" clientId model)
+                                        ?= ( { model | listens = Dict.insert ( clientId, listenRequest.channel ) sub model.listens }, Cmd.none )
+                            in
+                                withConnectionId clientId finalModel "listen" cmd
+
+                        Unlisten unlistenRequest ->
+                            let
+                                ( finalModel, cmd ) =
+                                    Dict.get ( clientId, unlistenRequest.channel ) model.listens
+                                        |?> (\_ -> ( { model | listens = Dict.remove ( clientId, unlistenRequest.channel ) model.listens }, Cmd.none ))
+                                        ?= respondError ("Listen does not exists for Channel: " ++ unlistenRequest.channel) "unlisten" clientId model
+                            in
+                                withConnectionId clientId finalModel "unlisten" cmd
+
+                        UnknownProxyRequest error ->
+                            respondError ("Unknown request: " ++ json ++ " Error: " ++ error) "unknown" clientId model
     in
-        case model.running of
-            NotRunning ->
-                (model ! [])
+        case model.authenticate <| getSessionId json of
+            True ->
+                handle model.running
 
-            Running ->
-                case request of
-                    Connect connectionRequest ->
-                        ( model, Postgres.connect (PGConnectError clientId) (PGConnected clientId) (PGConnectionLost clientId) pgConnectTimeout connectionRequest.host connectionRequest.port_ connectionRequest.database connectionRequest.user connectionRequest.password )
-
-                    Disconnect disconnectionRequest ->
-                        withConnectionId clientId model "disconnect" <| Postgres.disconnect (PGDisconnectError clientId) (PGDisconnected clientId) connectionId disconnectionRequest.discardConnection
-
-                    Query queryRequest ->
-                        withConnectionId clientId model "query" <| Postgres.query (PGQueryError "query" clientId) (PGQuerySuccess "query" clientId) connectionId queryRequest.sql queryRequest.recordCount
-
-                    MoreQueryResults moreQueryResultsRequest ->
-                        withConnectionId clientId model "moreQueryResults" <| Postgres.moreQueryResults (PGQueryError "moreQueryResults" clientId) (PGQuerySuccess "moreQueryResults" clientId) connectionId
-
-                    ExecuteSql executeSqlRequest ->
-                        withConnectionId clientId model "executeSql" <| Postgres.executeSql (PGExecuteSqlError clientId) (PGExecuteSqlSuccess clientId) connectionId executeSqlRequest.sql
-
-                    Listen listenRequest ->
-                        let
-                            sub =
-                                Postgres.listen (PGListenError clientId ListenType) (PGListenSuccess clientId) (PGListenEvent clientId) connectionId listenRequest.channel
-
-                            ( finalModel, cmd ) =
-                                Dict.get ( clientId, listenRequest.channel ) model.listens
-                                    |?> (\_ -> respondError ("Listen already exists for Channel: " ++ listenRequest.channel) "listen" clientId model)
-                                    ?= ( { model | listens = Dict.insert ( clientId, listenRequest.channel ) sub model.listens }, Cmd.none )
-                        in
-                            withConnectionId clientId finalModel "listen" cmd
-
-                    Unlisten unlistenRequest ->
-                        let
-                            ( finalModel, cmd ) =
-                                Dict.get ( clientId, unlistenRequest.channel ) model.listens
-                                    |?> (\_ -> ( { model | listens = Dict.remove ( clientId, unlistenRequest.channel ) model.listens }, Cmd.none ))
-                                    ?= respondError ("Listen does not exists for Channel: " ++ unlistenRequest.channel) "unlisten" clientId model
-                        in
-                            withConnectionId clientId finalModel "unlisten" cmd
-
-                    UnknownProxyRequest error ->
-                        respond clientId model <| Debug.crash "Unknown request: " ++ json ++ " Error: " ++ error
+            False ->
+                respondError "Invalid session" "unknown" clientId model
 
 
 {-| subscriptions
