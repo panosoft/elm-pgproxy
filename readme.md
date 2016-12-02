@@ -37,7 +37,7 @@ This was done to allow maximum flexibility for users of this module. Here's an e
 Postgres.clientSideConfig ConfigError Configured BadResponse (Just "ws://localhost:8080/pgproxy") (Just "{\"sessionId\": \"1f137f5f-43ec-4393-b5e8-bf195015e697\"}")
 ```
 
-Also sent in the request is `requestId`, which is just echoed back in the response. It's an `Int`.
+Also sent in the request is `requestId`, which is an `Int`. This id is echoed back in the response, which allows correlation between client and server logs.
 
 ### Responses
 
@@ -65,4 +65,4 @@ And for non-successful responses:
 
 The App in the test code is an example server that houses PGProxy which is a service. It's written to support multiple services with the same interface as PGProxy. This was not necessary for this single service, but was more as a proof of concept for additional services which is how Panoramic will be using this module.
 
-When you write your own server, this should be a good starting point.
+If you write your own server, this should be a good starting point.

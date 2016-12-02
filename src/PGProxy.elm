@@ -1,6 +1,6 @@
 module PGProxy
     exposing
-        ( initModel
+        ( init
         , update
         , subscriptions
         , Model
@@ -11,7 +11,7 @@ module PGProxy
 
 This is a proxy for Postgres Effects Manager on the client.
 
-@docs initModel, update, subscriptions, Model, Msg
+@docs init, update, subscriptions, Model, Msg
 
 -}
 
@@ -66,17 +66,21 @@ type alias LogTagger msg =
 
 {-| Model
 -}
-type alias Model msg =
+type alias Model =
+    { running : ServiceRunningStatus
+    , listenError : Bool
+    , clients : ClientDict
+    , listens : ListenDict
+    }
+
+
+type alias Config msg =
     { authenticate : SessionId -> Bool
     , wsPort : WSPort
     , errorTagger : ErrorTagger msg
     , logTagger : LogTagger msg
     , startedMsg : msg
     , stoppedMsg : msg
-    , running : ServiceRunningStatus
-    , listenError : Bool
-    , clients : ClientDict
-    , listens : ListenDict
     }
 
 
@@ -143,25 +147,11 @@ jsonStringEscape string =
             |> replace "\"" "\\\""
 
 
-{-| Initialize the PGProxy's model
-
-    Usage:
-        PGProxy.initModel PGError PGLog PGProxyStarted PGProxyStopped authenticate wsPort
-
-    where:
-        PGError, PGLog, PGProxyStarted and PGProxyStopped are your application messages
-        authenticate is a function that takes a sessionId and authenticates that the session is valid
-        wsPort is the Websocket Port to Listen on. The path is '/pgproxy'
+{-| Initialize the PGProxy
 -}
-initModel : ErrorTagger msg -> LogTagger msg -> msg -> msg -> (SessionId -> Bool) -> WSPort -> ( Model msg, Msg, Msg )
-initModel errorTagger logTagger startedMsg stoppedMsg authenticate wsPort =
-    ( { authenticate = authenticate
-      , wsPort = wsPort
-      , errorTagger = errorTagger
-      , logTagger = logTagger
-      , startedMsg = startedMsg
-      , stoppedMsg = stoppedMsg
-      , running = NotRunning
+init : ( Model, Msg, Msg )
+init =
+    ( { running = NotRunning
       , listenError = False
       , clients = Dict.empty
       , listens = Dict.empty
@@ -176,7 +166,7 @@ initClientState =
     ClientState Nothing Nothing Nothing
 
 
-getClientState : Model msg -> ClientId -> ClientState
+getClientState : Model -> ClientId -> ClientState
 getClientState model clientId =
     let
         maybeClientState =
@@ -193,7 +183,7 @@ getClientState model clientId =
         maybeClientState ?= initClientState
 
 
-setClientField : ClientId -> (ClientState -> ClientState) -> Model msg -> Model msg
+setClientField : ClientId -> (ClientState -> ClientState) -> Model -> Model
 setClientField clientId mutateClientState model =
     let
         clientState =
@@ -205,29 +195,29 @@ setClientField clientId mutateClientState model =
         { model | clients = newClients }
 
 
-setFatalError : ClientId -> String -> Model msg -> Model msg
+setFatalError : ClientId -> String -> Model -> Model
 setFatalError clientId error =
     setClientField clientId (\clientState -> { clientState | fatalError = Just error })
 
 
-setLastJson : ClientId -> String -> Model msg -> Model msg
+setLastJson : ClientId -> String -> Model -> Model
 setLastJson clientId json =
     setClientField clientId (\clientState -> { clientState | lastJson = Just json })
 
 
-setConnectionId : ClientId -> ConnectionId -> Model msg -> Model msg
+setConnectionId : ClientId -> ConnectionId -> Model -> Model
 setConnectionId clientId connectionId =
     setClientField clientId (\clientState -> { clientState | connectionId = Just connectionId })
 
 
-clearConnectionId : ClientId -> Model msg -> Model msg
+clearConnectionId : ClientId -> Model -> Model
 clearConnectionId clientId =
     setClientField clientId (\clientState -> { clientState | connectionId = Nothing })
 
 
-respond : ClientId -> Model msg -> Response -> ( Model msg, Cmd Msg )
-respond clientId model =
-    (,) model << Websocket.send SendError Sent model.wsPort clientId
+respond : ClientId -> Model -> Config msg -> Response -> ( Model, Cmd Msg )
+respond clientId model config =
+    (,) model << Websocket.send SendError Sent config.wsPort clientId
 
 
 getRequestId : String -> String
@@ -240,8 +230,8 @@ getRequestId request =
             "Missing request Id"
 
 
-respondMessage : Maybe Bool -> Bool -> Maybe ( String, String ) -> Maybe String -> ResponseType -> ClientId -> Model msg -> ( Model msg, Cmd Msg )
-respondMessage maybeSuccess unsolicited maybeKeyValuePair keysFormatted type_ clientId model =
+respondMessageConfig : Config msg -> Maybe Bool -> Bool -> Maybe ( String, String ) -> Maybe String -> ResponseType -> ClientId -> Model -> ( Model, Cmd Msg )
+respondMessageConfig config maybeSuccess unsolicited maybeKeyValuePair keysFormatted type_ clientId model =
     let
         clientState =
             getClientState model clientId
@@ -279,26 +269,26 @@ respondMessage maybeSuccess unsolicited maybeKeyValuePair keysFormatted type_ cl
                 ++ (keysFormatted ?= keyMessage)
                 ++ "}"
     in
-        respond clientId model responseFormatted
+        respond clientId model config responseFormatted
 
 
-respondError : String -> ResponseType -> ClientId -> Model msg -> ( Model msg, Cmd Msg )
-respondError message =
-    respondMessage (Just False) False (Just ( "error", message )) Nothing
+respondErrorConfig : Config msg -> String -> ResponseType -> ClientId -> Model -> ( Model, Cmd Msg )
+respondErrorConfig config message =
+    respondMessageConfig config (Just False) False (Just ( "error", message )) Nothing
 
 
-respondUnsolicited : String -> String -> ResponseType -> ClientId -> Model msg -> ( Model msg, Cmd Msg )
-respondUnsolicited key message =
-    respondMessage Nothing True (Just ( key, message )) Nothing
+respondUnsolicitedConfig : Config msg -> String -> String -> ResponseType -> ClientId -> Model -> ( Model, Cmd Msg )
+respondUnsolicitedConfig config key message =
+    respondMessageConfig config Nothing True (Just ( key, message )) Nothing
 
 
-respondSimpleSuccess : ResponseType -> ClientId -> Model msg -> ( Model msg, Cmd Msg )
-respondSimpleSuccess =
-    respondMessage (Just True) False Nothing Nothing
+respondSimpleSuccessConfig : Config msg -> ResponseType -> ClientId -> Model -> ( Model, Cmd Msg )
+respondSimpleSuccessConfig config =
+    respondMessageConfig config (Just True) False Nothing Nothing
 
 
-delayCmd : Msg -> Time -> Cmd Msg
-delayCmd msg delay =
+delayMsg : Msg -> Time -> Cmd Msg
+delayMsg msg delay =
     Task.perform (\_ -> Nop) (\_ -> msg) <| Process.sleep delay
 
 
@@ -332,8 +322,8 @@ type Msg
 
 {-| PGProxy update
 -}
-update : Msg -> Model msg -> ( ( Model msg, Cmd Msg ), List msg )
-update msg model =
+update : Config msg -> Msg -> Model -> ( ( Model, Cmd Msg ), List msg )
+update config msg model =
     let
         removeClient clientId model =
             let
@@ -346,28 +336,40 @@ update msg model =
                     | clients = Dict.remove clientId model.clients
                     , listens = newListens
                 }
+
+        respondMessage =
+            respondMessageConfig config
+
+        respondError =
+            respondErrorConfig config
+
+        respondUnsolicited =
+            respondUnsolicitedConfig config
+
+        respondSimpleSuccess =
+            respondSimpleSuccessConfig config
     in
         case msg of
             Nop ->
                 ( model ! [], [] )
 
             Start ->
-                ( { model | running = Running } ! [], [ model.startedMsg ] )
+                ( { model | running = Running } ! [], [ config.startedMsg ] )
 
             Stop ->
-                ( { model | running = NotRunning } ! [ delayCmd DelayedStop 5000 ], [] )
+                ( { model | running = NotRunning } ! [ delayMsg DelayedStop 5000 ], [] )
 
             DelayedStop ->
                 let
                     newModel =
                         List.foldl (\clientId model -> removeClient clientId model) model <| Dict.keys model.clients
                 in
-                    ( newModel ! [], [ model.stoppedMsg ] )
+                    ( newModel ! [], [ config.stoppedMsg ] )
 
             ConnectionStatus ( wsPort, clientId, ipAddress, status ) ->
                 let
                     logCmd =
-                        model.logTagger <| String.join " " [ toString status, "from ipAddress:", ipAddress, " on port:", toString wsPort, "for clientId:", toString clientId ]
+                        config.logTagger <| String.join " " [ toString status, "from ipAddress:", ipAddress, " on port:", toString wsPort, "for clientId:", toString clientId ]
                 in
                     ( (case status of
                         Connected ->
@@ -391,20 +393,20 @@ update msg model =
                     )
 
             InternalDisconnectError clientId ( connectionId, error ) ->
-                ( model ! [], [ model.errorTagger <| "Internal Disconnect Error: " ++ toString ( clientId, connectionId, error ) ] )
+                ( model ! [], [ config.errorTagger <| "Internal Disconnect Error: " ++ toString ( clientId, connectionId, error ) ] )
 
             InternalDisconnected clientId connectionId ->
-                ( model ! [], [ model.logTagger <| "Internal Disconnect Complete for clientId" ++ toString clientId ] )
+                ( model ! [], [ config.logTagger <| "Internal Disconnect Complete for clientId" ++ toString clientId ] )
 
             ListenError ( wsPort, path, error ) ->
-                ( { model | listenError = True } ! [], [ model.errorTagger ("Unable to listen to websocket on port: " ++ (toString model.wsPort) ++ " for path: " ++ path ++ " error: " ++ error) ] )
+                ( { model | listenError = True } ! [], [ config.errorTagger ("Unable to listen to websocket on port: " ++ (toString wsPort) ++ " for path: " ++ path ++ " error: " ++ error) ] )
 
             SendError ( wsPort, clientId, error ) ->
                 let
                     errorMsg =
-                        ("Unable to send to websocket on port: ") ++ (toString model.wsPort) ++ " for clientId: " ++ (toString clientId) ++ " error: " ++ error
+                        ("Unable to send to websocket on port: ") ++ (toString wsPort) ++ " for clientId: " ++ (toString clientId) ++ " error: " ++ error
                 in
-                    ( setFatalError clientId errorMsg model ! [], [ model.errorTagger errorMsg ] )
+                    ( setFatalError clientId errorMsg model ! [], [ config.errorTagger errorMsg ] )
 
             Sent ( wsPort, clientId, message ) ->
                 ( model ! [], [] )
@@ -424,7 +426,7 @@ update msg model =
                     ( newModel, cmd ) =
                         clientState.fatalError
                             |?> (\fatalError -> respondError fatalError type_ clientId model)
-                            ?= handleRequest model clientId json request clientState
+                            ?= handleRequest config model clientId json request clientState
                 in
                     ( setLastJson clientId json newModel ! [ cmd ], [] )
 
@@ -432,7 +434,7 @@ update msg model =
                 ( respondError error "connect" clientId model, [] )
 
             PGConnected clientId connectionId ->
-                ( respondSimpleSuccess "connect" clientId <| setConnectionId clientId connectionId model, [] )
+                ( respondSimpleSuccess "connect" clientId (setConnectionId clientId connectionId model), [] )
 
             PGConnectionLost clientId ( connectionId, error ) ->
                 ( respondUnsolicited "connectionLostError" error "connect" clientId model, [] )
@@ -441,7 +443,7 @@ update msg model =
                 ( respondError error "disconnect" clientId model, [] )
 
             PGDisconnected clientId connectionId ->
-                ( respondSimpleSuccess "disconnect" clientId <| clearConnectionId clientId model, [] )
+                ( respondSimpleSuccess "disconnect" clientId (clearConnectionId clientId model), [] )
 
             PGExecuteSqlError clientId ( connectionId, error ) ->
                 ( respondError error "executeSql" clientId model, [] )
@@ -497,9 +499,12 @@ getSessionId json =
             "Missing session Id"
 
 
-handleRequest : Model msg -> ClientId -> String -> ProxyRequest -> ClientState -> ( Model msg, Cmd Msg )
-handleRequest model clientId json request clientState =
+handleRequest : Config msg -> Model -> ClientId -> String -> ProxyRequest -> ClientState -> ( Model, Cmd Msg )
+handleRequest config model clientId json request clientState =
     let
+        respondError =
+            respondErrorConfig config
+
         connectionId =
             clientState.connectionId ?= -1
 
@@ -557,7 +562,7 @@ handleRequest model clientId json request clientState =
                         UnknownProxyRequest error ->
                             respondError ("Unknown request: " ++ json ++ " Error: " ++ error) "unknown" clientId model
     in
-        case model.authenticate <| getSessionId json of
+        case config.authenticate <| getSessionId json of
             True ->
                 handle model.running
 
@@ -567,13 +572,13 @@ handleRequest model clientId json request clientState =
 
 {-| subscriptions
 -}
-subscriptions : Model msg -> Sub Msg
-subscriptions model =
+subscriptions : Config msg -> Model -> Sub Msg
+subscriptions config model =
     case model.running of
         Running ->
             case not model.listenError of
                 True ->
-                    Sub.batch <| Websocket.listen ListenError WSMessage ConnectionStatus model.wsPort path :: Dict.values model.listens
+                    Sub.batch <| Websocket.listen ListenError WSMessage ConnectionStatus config.wsPort path :: Dict.values model.listens
 
                 False ->
                     Sub.none
