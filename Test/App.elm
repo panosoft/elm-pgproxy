@@ -216,6 +216,7 @@ update msg model =
             updatePGProxy msg model
 
 
+pgProxyConfig : PGProxy.Config msg
 pgProxyConfig =
     { authenticate = authenticate
     , wsPort = wsPort

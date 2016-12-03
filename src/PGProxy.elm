@@ -3,6 +3,7 @@ module PGProxy
         ( init
         , update
         , subscriptions
+        , Config
         , Model
         , Msg
         )
@@ -11,7 +12,7 @@ module PGProxy
 
 This is a proxy for Postgres Effects Manager on the client.
 
-@docs init, update, subscriptions, Model, Msg
+@docs init, update, subscriptions, Config, Model, Msg
 
 -}
 
@@ -74,6 +75,8 @@ type alias Model =
     }
 
 
+{-| PGProxy's config
+-}
 type alias Config msg =
     { authenticate : SessionId -> Bool
     , wsPort : WSPort
@@ -299,7 +302,7 @@ type Msg
     | Start
     | Stop
     | DelayedStop
-    | ConnectionStatus ( WSPort, ClientId, IPAddress, ConnectionStatus )
+    | ConnectionStatus ( WSPort, Path, ClientId, IPAddress, ConnectionStatus )
     | ListenError ( WSPort, Path, String )
     | WSMessage ( ClientId, QueryString, String )
     | SendError ( WSPort, ClientId, String )
@@ -366,10 +369,10 @@ update config msg model =
                 in
                     ( newModel ! [], [ config.stoppedMsg ] )
 
-            ConnectionStatus ( wsPort, clientId, ipAddress, status ) ->
+            ConnectionStatus ( wsPort, path, clientId, ipAddress, status ) ->
                 let
                     logCmd =
-                        config.logTagger <| String.join " " [ toString status, "from ipAddress:", ipAddress, " on port:", toString wsPort, "for clientId:", toString clientId ]
+                        config.logTagger <| String.join " " [ toString status, "from ipAddress: ", ipAddress, " on port: ", toString wsPort, " on path: ", toString path, " for clientId: ", toString clientId ]
                 in
                     ( (case status of
                         Connected ->
