@@ -78,6 +78,17 @@ initModel =
         }
 
 
+pgProxyConfig : PGProxy.Config Msg
+pgProxyConfig =
+    { authenticate = authenticate
+    , wsPort = wsPort
+    , errorTagger = PGProxyError
+    , logTagger = PGProxyLog
+    , startedMsg = PGProxyStarted
+    , stoppedMsg = PGProxyStopped
+    }
+
+
 init : ( Model, Cmd Msg )
 init =
     initModel ! [ Websocket.startServer ServerError ServerStatus UnhandledMessage Nothing Nothing wsPort ]
@@ -93,143 +104,128 @@ main =
         }
 
 
-serviceStopped : Model -> ( Model, Cmd Msg )
-serviceStopped model =
-    let
-        newModel =
-            { model | serviceCount = model.serviceCount - 1 }
-
-        cmd =
-            case newModel.serviceCount of
-                0 ->
-                    Websocket.stopServer ServerError ServerStatus wsPort
-
-                _ ->
-                    Cmd.none
-    in
-        ( newModel, cmd )
-
-
-startStopServices : Model -> List (Model -> ( Model, Cmd Msg )) -> ( Model, Cmd Msg )
-startStopServices model serviceUpdates =
-    let
-        ( newModel, cmds ) =
-            List.foldl
-                (\updateService ( model, cmds ) ->
-                    let
-                        ( newModel, cmd ) =
-                            updateService model
-                    in
-                        ( newModel, cmd :: cmds )
-                )
-                ( model, [] )
-                serviceUpdates
-    in
-        newModel ! cmds
-
-
-startServices : Model -> ( Model, Cmd Msg )
-startServices model =
-    startStopServices model
-        [ updatePGProxy model.pgProxyStartMsg
-        ]
-
-
-stopServices : Model -> ( Model, Cmd Msg )
-stopServices model =
-    startStopServices model
-        [ updatePGProxy model.pgProxyStopMsg
-        ]
-
-
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
-    case msg of
-        Nop ->
-            model ! []
-
-        StopServer _ ->
+    let
+        serviceStopped : Model -> ( Model, Cmd Msg )
+        serviceStopped model =
             let
-                l =
-                    Debug.log "Stopping Server" "..."
-            in
-                stopServices model
-
-        ServerError ( wsPort, error ) ->
-            let
-                l =
-                    Debug.log "ServerError" ( wsPort, error )
-            in
-                model ! [ exitApp -1 ]
-
-        ServerStatus ( wsPort, status ) ->
-            let
-                l =
-                    Debug.log "ServerStatus" ( wsPort, status )
-
                 newModel =
-                    { model | status = Running }
+                    { model | serviceCount = model.serviceCount - 1 }
+
+                cmd =
+                    case newModel.serviceCount of
+                        0 ->
+                            Websocket.stopServer ServerError ServerStatus wsPort
+
+                        _ ->
+                            Cmd.none
             in
-                case status of
-                    Started ->
-                        startServices newModel
+                ( newModel, cmd )
 
-                    Stopped ->
-                        ( model, exitApp 1 )
-
-        UnhandledMessage ( wsPort, path, queryString, clientId, message ) ->
+        startStopServices : Model -> List (Model -> ( Model, Cmd Msg )) -> ( Model, Cmd Msg )
+        startStopServices model serviceUpdates =
             let
-                l =
-                    Debug.log "UnhandledMessage" ( wsPort, path, queryString, clientId, message )
+                ( newModel, cmds ) =
+                    List.foldl
+                        (\updateService ( model, cmds ) ->
+                            let
+                                ( newModel, cmd ) =
+                                    updateService model
+                            in
+                                ( newModel, cmd :: cmds )
+                        )
+                        ( model, [] )
+                        serviceUpdates
             in
+                newModel ! cmds
+
+        startServices : Model -> ( Model, Cmd Msg )
+        startServices model =
+            startStopServices model
+                [ updatePGProxy model.pgProxyStartMsg
+                ]
+
+        stopServices : Model -> ( Model, Cmd Msg )
+        stopServices model =
+            startStopServices model
+                [ updatePGProxy model.pgProxyStopMsg
+                ]
+
+        updatePGProxy : PGProxy.Msg -> Model -> ( Model, Cmd Msg )
+        updatePGProxy =
+            ParentChildUpdate.updateChildApp (PGProxy.update pgProxyConfig) update .pgProxyModel PGProxyModule (\model pgProxyModel -> { model | pgProxyModel = pgProxyModel })
+    in
+        case msg of
+            Nop ->
                 model ! []
 
-        PGProxyStarted ->
-            let
-                l =
-                    Debug.log "PGProxyStarted" ""
-            in
-                model ! []
+            StopServer _ ->
+                let
+                    l =
+                        Debug.log "Stopping Server" "..."
+                in
+                    stopServices model
 
-        PGProxyStopped ->
-            let
-                l =
-                    Debug.log "PGProxyStopped" ""
-            in
-                serviceStopped model
+            ServerError ( wsPort, error ) ->
+                let
+                    l =
+                        Debug.log "ServerError" ( wsPort, error )
+                in
+                    model ! [ exitApp -1 ]
 
-        PGProxyError error ->
-            let
-                l =
-                    Debug.log "PGProxyError" error
-            in
-                model ! []
+            ServerStatus ( wsPort, status ) ->
+                let
+                    l =
+                        Debug.log "ServerStatus" ( wsPort, status )
 
-        PGProxyLog message ->
-            let
-                l =
-                    Debug.log "PGProxyLog" message
-            in
-                model ! []
+                    newModel =
+                        { model | status = Running }
+                in
+                    case status of
+                        Started ->
+                            startServices newModel
 
-        PGProxyModule msg ->
-            updatePGProxy msg model
+                        Stopped ->
+                            ( model, exitApp 1 )
 
+            UnhandledMessage ( wsPort, path, queryString, clientId, message ) ->
+                let
+                    l =
+                        Debug.log "UnhandledMessage" ( wsPort, path, queryString, clientId, message )
+                in
+                    model ! []
 
-pgProxyConfig : PGProxy.Config msg
-pgProxyConfig =
-    { authenticate = authenticate
-    , wsPort = wsPort
-    , errorTagger = PGProxyError
-    , logTagger = PGProxyLog
-    , startedMsg = PGProxyStarted
-    , stoppedMsg = PGProxyStopped
-    }
+            PGProxyStarted ->
+                let
+                    l =
+                        Debug.log "PGProxyStarted" ""
+                in
+                    model ! []
 
+            PGProxyStopped ->
+                let
+                    l =
+                        Debug.log "PGProxyStopped" ""
+                in
+                    serviceStopped model
 
-updatePGProxy : PGProxy.Msg -> Model -> ( Model, Cmd Msg )
-updatePGProxy =
-    ParentChildUpdate.updateChildApp (PGProxy.update pgProxyConfig) update .pgProxyModel PGProxyModule (\model pgProxyModel -> { model | pgProxyModel = pgProxyModel })
+            PGProxyError error ->
+                let
+                    l =
+                        Debug.log "PGProxyError" error
+                in
+                    model ! []
+
+            PGProxyLog message ->
+                let
+                    l =
+                        Debug.log "PGProxyLog" message
+                in
+                    model ! []
+
+            PGProxyModule msg ->
+                updatePGProxy msg model
 
 
 subscriptions : Model -> Sub Msg
