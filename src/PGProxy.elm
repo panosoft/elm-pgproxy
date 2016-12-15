@@ -111,23 +111,6 @@ path =
     flip Maybe.map
 
 
-{-| lazy version of ?= operator
--}
-(?!=) : Maybe a -> (() -> a) -> a
-(?!=) maybe lazy =
-    case maybe of
-        Just x ->
-            x
-
-        Nothing ->
-            lazy ()
-
-
-(&>) : Task x a -> Task x b -> Task x b
-(&>) t1 t2 =
-    t1 `Task.andThen` \_ -> t2
-
-
 (///) : Result err value -> (err -> value) -> value
 (///) result f =
     case result of
@@ -152,13 +135,14 @@ jsonStringEscape string =
 
 {-| Initialize the PGProxy
 -}
-init : ( Model, Msg, Msg )
+init : ( ( Model, Cmd Msg ), Msg, Msg )
 init =
     ( { running = NotRunning
       , listenError = False
       , clients = Dict.empty
       , listens = Dict.empty
       }
+        ! []
     , Start
     , Stop
     )
