@@ -64,18 +64,20 @@ authenticate _ =
     True
 
 
-initModel : Model
+initModel : ( Model, List (Cmd Msg) )
 initModel =
     let
-        ( pgProxyModel, pgProxyStartMsg, pgProxyStopMsg ) =
+        ( ( pgProxyModel, pgProxyCmd ), pgProxyStartMsg, pgProxyStopMsg ) =
             PGProxy.init
     in
-        { status = NotRunning
-        , serviceCount = 1
-        , pgProxyModel = pgProxyModel
-        , pgProxyStartMsg = pgProxyStartMsg
-        , pgProxyStopMsg = pgProxyStopMsg
-        }
+        ( { status = NotRunning
+          , serviceCount = 1
+          , pgProxyModel = pgProxyModel
+          , pgProxyStartMsg = pgProxyStartMsg
+          , pgProxyStopMsg = pgProxyStopMsg
+          }
+        , [ Cmd.map PGProxyModule pgProxyCmd ]
+        )
 
 
 pgProxyConfig : PGProxy.Config Msg
@@ -91,7 +93,11 @@ pgProxyConfig =
 
 init : ( Model, Cmd Msg )
 init =
-    initModel ! [ Websocket.startServer ServerError ServerStatus UnhandledMessage Nothing Nothing wsPort ]
+    let
+        ( model, servicesCmds ) =
+            initModel
+    in
+        model ! (List.append servicesCmds [ Websocket.startServer ServerError ServerStatus UnhandledMessage Nothing Nothing wsPort ])
 
 
 main : Program Never
