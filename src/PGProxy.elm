@@ -202,9 +202,9 @@ clearConnectionId clientId =
     setClientField clientId (\clientState -> { clientState | connectionId = Nothing })
 
 
-respond : ClientId -> Model -> Config msg -> Response -> ( Model, Cmd Msg )
-respond clientId model config =
-    (,) model << Websocket.send SendError Sent config.wsPort clientId
+respond : ClientId -> Model -> WSPort -> Response -> ( Model, Cmd Msg )
+respond clientId model wsPort =
+    (,) model << Websocket.send SendError Sent wsPort clientId
 
 
 getRequestId : String -> String
@@ -217,8 +217,8 @@ getRequestId request =
             "Missing request Id"
 
 
-respondMessageConfig : Config msg -> Maybe Bool -> Bool -> Maybe ( String, String ) -> Maybe String -> ResponseType -> ClientId -> Model -> ( Model, Cmd Msg )
-respondMessageConfig config maybeSuccess unsolicited maybeKeyValuePair keysFormatted type_ clientId model =
+respondMessageConfig : WSPort -> Maybe Bool -> Bool -> Maybe ( String, String ) -> Maybe String -> ResponseType -> ClientId -> Model -> ( Model, Cmd Msg )
+respondMessageConfig wsPort maybeSuccess unsolicited maybeKeyValuePair keysFormatted type_ clientId model =
     let
         clientState =
             getClientState model clientId
@@ -256,22 +256,22 @@ respondMessageConfig config maybeSuccess unsolicited maybeKeyValuePair keysForma
                 ++ (keysFormatted ?= keyMessage)
                 ++ "}"
     in
-        respond clientId model config responseFormatted
+        respond clientId model wsPort responseFormatted
 
 
-respondErrorConfig : Config msg -> String -> ResponseType -> ClientId -> Model -> ( Model, Cmd Msg )
-respondErrorConfig config message =
-    respondMessageConfig config (Just False) False (Just ( "error", message )) Nothing
+respondErrorConfig : WSPort -> String -> ResponseType -> ClientId -> Model -> ( Model, Cmd Msg )
+respondErrorConfig wsPort message =
+    respondMessageConfig wsPort (Just False) False (Just ( "error", message )) Nothing
 
 
-respondUnsolicitedConfig : Config msg -> String -> String -> ResponseType -> ClientId -> Model -> ( Model, Cmd Msg )
-respondUnsolicitedConfig config key message =
-    respondMessageConfig config Nothing True (Just ( key, message )) Nothing
+respondUnsolicitedConfig : WSPort -> String -> String -> ResponseType -> ClientId -> Model -> ( Model, Cmd Msg )
+respondUnsolicitedConfig wsPort key message =
+    respondMessageConfig wsPort Nothing True (Just ( key, message )) Nothing
 
 
-respondSimpleSuccessConfig : Config msg -> ResponseType -> ClientId -> Model -> ( Model, Cmd Msg )
-respondSimpleSuccessConfig config =
-    respondMessageConfig config (Just True) False Nothing Nothing
+respondSimpleSuccessConfig : WSPort -> ResponseType -> ClientId -> Model -> ( Model, Cmd Msg )
+respondSimpleSuccessConfig wsPort =
+    respondMessageConfig wsPort (Just True) False Nothing Nothing
 
 
 delayMsg : Msg -> Time -> Cmd Msg
@@ -325,16 +325,16 @@ update config msg model =
                 }
 
         respondMessage =
-            respondMessageConfig config
+            respondMessageConfig config.wsPort
 
         respondError =
-            respondErrorConfig config
+            respondErrorConfig config.wsPort
 
         respondUnsolicited =
-            respondUnsolicitedConfig config
+            respondUnsolicitedConfig config.wsPort
 
         respondSimpleSuccess =
-            respondSimpleSuccessConfig config
+            respondSimpleSuccessConfig config.wsPort
     in
         case msg of
             Nop ->
@@ -490,7 +490,7 @@ handleRequest : Config msg -> Model -> ClientId -> String -> ProxyRequest -> Cli
 handleRequest config model clientId json request clientState =
     let
         respondError =
-            respondErrorConfig config
+            respondErrorConfig config.wsPort
 
         connectionId =
             clientState.connectionId ?= -1
