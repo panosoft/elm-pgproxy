@@ -1,14 +1,14 @@
-# Postgres Authenticating Proxy Server in Elm
+# Postgres Authenticating Proxy Service in Elm
 
-> This is a Proxy Server for the Elm [Postgres Effects Manager](https://github.com/panosoft/elm-postgres).
+> This is a Proxy Service for the Elm [Postgres Effects Manager](https://github.com/panosoft/elm-postgres).
 
-> This proxy server allows the Postgres Effects Manager to be used on the **client**.
+> This proxy service allows the Postgres Effects Manager to be used on the **client**.
 
-> The Postgres Effects Manager's native code when run on the client will delegate to a Proxy Server as was specified in its `clientSideConfig` call. This Proxy Server can be used directly or as a reference implementation.
+> The Postgres Effects Manager's native code when run on the client will delegate to a Proxy Service as was specified in its `clientSideConfig` call. This Proxy Service can be used directly or as a reference implementation.
 
 > This module is written as a **service** meaning that it must be housed in a server. See [Test code](#test-code) below for more info.
 
-> This implementation is an authenticating proxy server. It delegates authentication for each request to the application via an injected authentication function. Once authenticated, it honors the request.
+> This implementation is an authenticating proxy service. It delegates authentication for each request to the server application. The authentication function is injected into the PGProxy service. Once authenticated, it honors the request.
 
 > It's built with the same Postgres Effects Manager as the client except it uses the server native code to make calls to the DB on behalf of the client.
 
