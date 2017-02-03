@@ -1,10 +1,15 @@
 port module Test.App exposing (..)
 
+import String exposing (..)
 import Html exposing (..)
 import Html.App
 import Websocket exposing (..)
 import PGProxy
 import ParentChildUpdate exposing (..)
+import Utils.Ops exposing (..)
+import Utils.Error exposing (..)
+import Utils.Log exposing (..)
+import DebugF exposing (..)
 
 
 port exitApp : Float -> Cmd msg
@@ -44,19 +49,9 @@ type Msg
     | UnhandledMessage ( WSPort, Path, QueryString, ClientId, String )
     | PGProxyStarted
     | PGProxyStopped
-    | PGProxyError String
-    | PGProxyLog String
+    | PGProxyError ( ErrorType, String )
+    | PGProxyLog ( LogLevel, String )
     | PGProxyModule PGProxy.Msg
-
-
-(?=) : Maybe a -> a -> a
-(?=) =
-    flip Maybe.withDefault
-
-
-(|?>) : Maybe a -> (a -> b) -> Maybe b
-(|?>) =
-    flip Maybe.map
 
 
 authenticate : SessionId -> Bool
@@ -68,7 +63,7 @@ initModel : ( Model, List (Cmd Msg) )
 initModel =
     let
         ( ( pgProxyModel, pgProxyCmd ), pgProxyStartMsg, pgProxyStopMsg ) =
-            PGProxy.init
+            PGProxy.init PGProxyModule
     in
         ( { status = NotRunning
           , serviceCount = 1
@@ -76,7 +71,7 @@ initModel =
           , pgProxyStartMsg = pgProxyStartMsg
           , pgProxyStopMsg = pgProxyStopMsg
           }
-        , [ Cmd.map PGProxyModule pgProxyCmd ]
+        , [ pgProxyCmd ]
         )
 
 
@@ -216,17 +211,23 @@ update msg model =
                 in
                     serviceStopped model
 
-            PGProxyError error ->
+            PGProxyError ( errorType, error ) ->
                 let
+                    fatalError =
+                        errorType == FatalError
+
+                    logIt =
+                        fatalError ?! ( \_ -> Debug.crash "FATAL ERROR", \_ -> Debug.log "PGProxyError" )
+
                     l =
-                        Debug.log "PGProxyError" error
+                        logIt error
                 in
                     model ! []
 
-            PGProxyLog message ->
+            PGProxyLog ( level, message ) ->
                 let
                     l =
-                        Debug.log "PGProxyLog" message
+                        DebugF.log "PGProxyLog" ((toUpper <| toString level) ++ ": " ++ message)
                 in
                     model ! []
 

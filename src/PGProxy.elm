@@ -27,6 +27,9 @@ import Json.Decode as JD exposing (..)
 import Websocket exposing (..)
 import Proxy.Decoder exposing (..)
 import Postgres exposing (..)
+import Utils.Error exposing (..)
+import Utils.Log exposing (..)
+import Services.Common.Taggers exposing (..)
 
 
 type alias ClientState =
@@ -57,14 +60,6 @@ type alias ListenDict =
     Dict ( ClientId, ListenChannel ) (Sub Msg)
 
 
-type alias ErrorTagger msg =
-    String -> msg
-
-
-type alias LogTagger msg =
-    String -> msg
-
-
 {-| Model
 -}
 type alias Model =
@@ -80,8 +75,8 @@ type alias Model =
 type alias Config msg =
     { authenticate : SessionId -> Bool
     , wsPort : WSPort
-    , errorTagger : ErrorTagger msg
-    , logTagger : LogTagger msg
+    , errorTagger : ErrorTagger String msg
+    , logTagger : LogTagger String msg
     , startedMsg : msg
     , stoppedMsg : msg
     }
@@ -135,8 +130,8 @@ jsonStringEscape string =
 
 {-| Initialize the PGProxy
 -}
-init : ( ( Model, Cmd Msg ), Msg, Msg )
-init =
+init : (Msg -> msg) -> ( ( Model, Cmd msg ), Msg, Msg )
+init tagger =
     ( { running = NotRunning
       , listenError = False
       , clients = Dict.empty
@@ -356,7 +351,7 @@ update config msg model =
             ConnectionStatus ( wsPort, path, clientId, ipAddress, status ) ->
                 let
                     logCmd =
-                        config.logTagger <| String.join " " [ toString status, "from ipAddress: ", ipAddress, " on port: ", toString wsPort, " on path: ", toString path, " for clientId: ", toString clientId ]
+                        config.logTagger <| ( LogLevelInfo, String.join " " [ toString status, "from ipAddress: ", ipAddress, " on port: ", toString wsPort, " on path: ", toString path, " for clientId: ", toString clientId ] )
                 in
                     ( (case status of
                         Connected ->
@@ -380,20 +375,20 @@ update config msg model =
                     )
 
             InternalDisconnectError clientId ( connectionId, error ) ->
-                ( model ! [], [ config.errorTagger <| "Internal Disconnect Error: " ++ toString ( clientId, connectionId, error ) ] )
+                ( model ! [], [ config.errorTagger <| ( NonFatalError, "Internal Disconnect Error: " ++ toString ( clientId, connectionId, error ) ) ] )
 
             InternalDisconnected clientId connectionId ->
-                ( model ! [], [ config.logTagger <| "Internal Disconnect Complete for clientId" ++ toString clientId ] )
+                ( model ! [], [ config.logTagger <| ( LogLevelInfo, "Internal Disconnect Complete for clientId" ++ toString clientId ) ] )
 
             ListenError ( wsPort, path, error ) ->
-                ( { model | listenError = True } ! [], [ config.errorTagger ("Unable to listen to websocket on port: " ++ (toString wsPort) ++ " for path: " ++ path ++ " error: " ++ error) ] )
+                ( { model | listenError = True } ! [], [ config.errorTagger ( FatalError, ("Unable to listen to websocket on port: " ++ (toString wsPort) ++ " for path: " ++ path ++ " error: " ++ error) ) ] )
 
             SendError ( wsPort, clientId, error ) ->
                 let
                     errorMsg =
                         ("Unable to send to websocket on port: ") ++ (toString wsPort) ++ " for clientId: " ++ (toString clientId) ++ " error: " ++ error
                 in
-                    ( setFatalError clientId errorMsg model ! [], [ config.errorTagger errorMsg ] )
+                    ( setFatalError clientId errorMsg model ! [], [ config.errorTagger ( NonFatalError, errorMsg ) ] )
 
             Sent ( wsPort, clientId, message ) ->
                 ( model ! [], [] )
