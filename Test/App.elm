@@ -1,8 +1,7 @@
 port module Test.App exposing (..)
 
+import Platform
 import String exposing (..)
-import Html exposing (..)
-import Html.App
 import Websocket exposing (..)
 import PGProxy
 import ParentChildUpdate exposing (..)
@@ -95,11 +94,10 @@ init =
         model ! (List.append servicesCmds [ Websocket.startServer ServerError ServerStatus UnhandledMessage Nothing Nothing wsPort ])
 
 
-main : Program Never
+main : Program Never Model Msg
 main =
-    Html.App.program
+    Platform.program
         { init = init
-        , view = (\_ -> text "")
         , update = update
         , subscriptions = subscriptions
         }

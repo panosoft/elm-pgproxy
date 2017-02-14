@@ -204,7 +204,7 @@ respond clientId model wsPort =
 
 getRequestId : String -> String
 getRequestId request =
-    case JD.decodeString ("requestId" := int) request of
+    case JD.decodeString (field "requestId" int) request of
         Ok requestId ->
             toString requestId
 
@@ -271,7 +271,7 @@ respondSimpleSuccessConfig wsPort =
 
 delayMsg : Msg -> Time -> Cmd Msg
 delayMsg msg delay =
-    Task.perform (\_ -> Nop) (\_ -> msg) <| Process.sleep delay
+    Task.perform (\_ -> msg) <| Process.sleep delay
 
 
 {-| PGProxy Msgs -
@@ -473,7 +473,7 @@ update config msg model =
 
 getSessionId : String -> SessionId
 getSessionId json =
-    case JD.decodeString ("sessionId" := string) json of
+    case JD.decodeString (field "sessionId" string) json of
         Ok sessionId ->
             sessionId
 
