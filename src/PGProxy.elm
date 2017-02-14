@@ -106,8 +106,8 @@ path =
     flip Maybe.map
 
 
-(///) : Result err value -> (err -> value) -> value
-(///) result f =
+(??=) : Result err value -> (err -> value) -> value
+(??=) result f =
     case result of
         Ok value ->
             value
@@ -399,7 +399,7 @@ update config msg model =
                         decodeRequest json
 
                     request =
-                        decodeResult /// (\err -> UnknownProxyRequest err)
+                        decodeResult ??= (\err -> UnknownProxyRequest err)
 
                     clientState =
                         getClientState model clientId
