@@ -1,6 +1,7 @@
 port module Test.App exposing (..)
 
 import Platform
+import Time
 import String exposing (..)
 import Websocket exposing (..)
 import PGProxy
@@ -40,29 +41,20 @@ wsPort =
     8080
 
 
-type Msg
-    = Nop
-    | StopServer ()
-    | ServerError ( WSPort, String )
-    | ServerStatus ( WSPort, ServerStatus )
-    | UnhandledMessage ( WSPort, Path, QueryString, ClientId, String )
-    | PGProxyStarted
-    | PGProxyStopped
-    | PGProxyError ( ErrorType, String )
-    | PGProxyLog ( LogLevel, String )
-    | PGProxyModule PGProxy.Msg
+type alias SessionModel =
+    {}
 
 
-authenticate : SessionId -> Bool
-authenticate _ =
-    True
+authenticate : SessionModel -> SessionId -> ( SessionModel, Bool )
+authenticate _ _ =
+    ( {}, True )
 
 
 initModel : ( Model, List (Cmd Msg) )
 initModel =
     let
         ( ( pgProxyModel, pgProxyCmd ), pgProxyStartMsg, pgProxyStopMsg ) =
-            PGProxy.init PGProxyModule
+            PGProxy.init pgProxyConfig PGProxyMsg
     in
         ( { status = NotRunning
           , serviceCount = 1
@@ -74,14 +66,20 @@ initModel =
         )
 
 
-pgProxyConfig : PGProxy.Config Msg
+pgProxyConfig : PGProxy.Config SessionModel Msg
 pgProxyConfig =
     { authenticate = authenticate
     , wsPort = wsPort
+    , path = "/pgproxy"
+    , delayBeforeStop = 5 * Time.second
+    , pgConnectTimeout = 15 * Time.second
     , errorTagger = PGProxyError
     , logTagger = PGProxyLog
     , startedMsg = PGProxyStarted
     , stoppedMsg = PGProxyStopped
+    , garbageCollectDisconnectedClientsAfterPeriod = 5 * Time.second
+    , debug = True
+    , idleDumpStateFrequency = 5 * Time.second
     }
 
 
@@ -103,10 +101,22 @@ main =
         }
 
 
+type Msg
+    = Nop
+    | StopServer ()
+    | ServerError ( WSPort, String )
+    | ServerStatus ( WSPort, ServerStatus )
+    | UnhandledMessage ( WSPort, Path, QueryString, ClientId, String )
+    | PGProxyStarted (Result String ())
+    | PGProxyStopped (Result String ())
+    | PGProxyError ( ErrorType, String )
+    | PGProxyLog ( LogLevel, String )
+    | PGProxyMsg PGProxy.Msg
+
+
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
     let
-        serviceStopped : Model -> ( Model, Cmd Msg )
         serviceStopped model =
             let
                 newModel =
@@ -122,7 +132,6 @@ update msg model =
             in
                 ( newModel, cmd )
 
-        startStopServices : Model -> List (Model -> ( Model, Cmd Msg )) -> ( Model, Cmd Msg )
         startStopServices model serviceUpdates =
             let
                 ( newModel, cmds ) =
@@ -139,21 +148,18 @@ update msg model =
             in
                 newModel ! cmds
 
-        startServices : Model -> ( Model, Cmd Msg )
         startServices model =
             startStopServices model
                 [ updatePGProxy model.pgProxyStartMsg
                 ]
 
-        stopServices : Model -> ( Model, Cmd Msg )
         stopServices model =
             startStopServices model
                 [ updatePGProxy model.pgProxyStopMsg
                 ]
 
-        updatePGProxy : PGProxy.Msg -> Model -> ( Model, Cmd Msg )
         updatePGProxy =
-            ParentChildUpdate.updateChildApp (PGProxy.update pgProxyConfig) update .pgProxyModel PGProxyModule (\model pgProxyModel -> { model | pgProxyModel = pgProxyModel })
+            updateChildApp (PGProxy.update pgProxyConfig) update (\model -> ( model.pgProxyModel, {} )) PGProxyMsg (\model ( pgProxyModel, _ ) -> { model | pgProxyModel = pgProxyModel })
     in
         case msg of
             Nop ->
@@ -177,13 +183,10 @@ update msg model =
                 let
                     l =
                         Debug.log "ServerStatus" ( wsPort, status )
-
-                    newModel =
-                        { model | status = Running }
                 in
                     case status of
                         Started ->
-                            startServices newModel
+                            startServices { model | status = Running }
 
                         Stopped ->
                             ( model, exitApp 1 )
@@ -195,17 +198,17 @@ update msg model =
                 in
                     model ! []
 
-            PGProxyStarted ->
+            PGProxyStarted result ->
                 let
                     l =
-                        Debug.log "PGProxyStarted" ""
+                        Debug.log "PGProxyStarted" result
                 in
                     model ! []
 
-            PGProxyStopped ->
+            PGProxyStopped result ->
                 let
                     l =
-                        Debug.log "PGProxyStopped" ""
+                        Debug.log "PGProxyStopped" result
                 in
                     serviceStopped model
 
@@ -229,7 +232,7 @@ update msg model =
                 in
                     model ! []
 
-            PGProxyModule msg ->
+            PGProxyMsg msg ->
                 updatePGProxy msg model
 
 
@@ -240,7 +243,7 @@ subscriptions model =
             externalStop StopServer
 
         pgProxySubs =
-            Sub.map PGProxyModule <| PGProxy.subscriptions pgProxyConfig model.pgProxyModel
+            Sub.map PGProxyMsg <| PGProxy.subscriptions pgProxyConfig model.pgProxyModel
     in
         case model.status of
             Running ->

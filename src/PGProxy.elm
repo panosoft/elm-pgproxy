@@ -16,257 +16,112 @@ This is a proxy for Postgres Effects Manager on the client.
 
 -}
 
+import Tuple
+import Set exposing (Set)
 import String
+import StringUtils exposing (..)
 import Time exposing (Time)
 import Process
 import List
 import Task exposing (Task)
 import Dict exposing (Dict)
-import Regex exposing (..)
 import Json.Decode as JD exposing (..)
+import ParentChildUpdate exposing (..)
 import Websocket exposing (..)
+import Respond exposing (..)
 import Proxy.Decoder exposing (..)
 import Postgres exposing (..)
 import Utils.Error exposing (..)
 import Utils.Log exposing (..)
+import Utils.Ops exposing (..)
+import Services.Common.Error as Error
 import Services.Common.Taggers exposing (..)
+import Client
+import ConnectionManager
+import DebugF
 
 
-type alias ClientState =
-    { fatalError : Maybe String
-    , lastJson : Maybe String
-    , connectionId : Maybe ConnectionId
+type alias SharedListenConnection =
+    { connectionId : ConnectionId
+    , clientIds : Set ClientId
+    , subscription : Sub Msg
     }
-
-
-type alias Response =
-    String
-
-
-type alias ResponseType =
-    String
-
-
-type alias ClientDict =
-    Dict ClientId ClientState
-
-
-type ServiceRunningStatus
-    = Running
-    | NotRunning
-
-
-type alias ListenDict =
-    Dict ( ClientId, ListenChannel ) (Sub Msg)
 
 
 {-| Model
 -}
 type alias Model =
-    { running : ServiceRunningStatus
+    { running : Bool
     , listenError : Bool
-    , clients : ClientDict
-    , listens : ListenDict
+    , clients : Dict ClientId Client.Model
+    , connectionManagerModel : ConnectionManager.Model Client.Msg
+    , currentTime : Time
+    , idleTime : Time
+    , stopDisconnectingCount : Int
     }
 
 
 {-| PGProxy's config
 -}
-type alias Config msg =
-    { authenticate : SessionId -> Bool
+type alias Config sessionModel msg =
+    { authenticate : sessionModel -> SessionId -> ( sessionModel, Bool )
     , wsPort : WSPort
+    , path : String
+    , delayBeforeStop : Time
+    , pgConnectTimeout : Time
     , errorTagger : ErrorTagger String msg
     , logTagger : LogTagger String msg
-    , startedMsg : msg
-    , stoppedMsg : msg
+    , startedMsg : Result String () -> msg
+    , stoppedMsg : Result String () -> msg
+    , garbageCollectDisconnectedClientsAfterPeriod : Time
+    , debug : Bool
+    , idleDumpStateFrequency : Time
     }
+
+
+tickPeriod : Time
+tickPeriod =
+    1 * Time.second
 
 
 type alias SessionId =
     String
 
 
-pgConnectTimeout : Int
-pgConnectTimeout =
-    15000
-
-
-path : String
-path =
-    "/pgproxy"
-
-
-(?=) : Maybe a -> a -> a
-(?=) =
-    flip Maybe.withDefault
-
-
-(|?>) : Maybe a -> (a -> b) -> Maybe b
-(|?>) =
-    flip Maybe.map
-
-
-(??=) : Result err value -> (err -> value) -> value
-(??=) result f =
-    case result of
-        Ok value ->
-            value
-
-        Err err ->
-            f err
-
-
-jsonStringEscape : String -> String
-jsonStringEscape string =
-    let
-        replace old new =
-            Regex.replace All (regex old) (\_ -> new)
-    in
-        string
-            |> replace "\\t" "\\\\t"
-            |> replace "\\n" "\\\\n"
-            |> replace "\"" "\\\""
+clientConfig : Config sessionModel msg -> Client.Config Msg
+clientConfig config =
+    { wsPort = config.wsPort
+    , pgConnectTimeout = config.pgConnectTimeout
+    , errorTagger = ClientError
+    , logTagger = ClientLog
+    , sendErrorTagger = SendError
+    , sentTagger = Sent
+    , clientDestroyedTagger = ClientDestroyed
+    , listenEventTagger = ListenEvent
+    }
 
 
 {-| Initialize the PGProxy
 -}
-init : (Msg -> msg) -> ( ( Model, Cmd msg ), Msg, Msg )
-init tagger =
-    ( { running = NotRunning
+init : Config sessionModel msg -> (Msg -> msg) -> ( ( Model, Cmd msg ), Msg, Msg )
+init config tagger =
+    ( { running = False
       , listenError = False
       , clients = Dict.empty
-      , listens = Dict.empty
+      , connectionManagerModel = ConnectionManager.init
+      , currentTime = 0
+      , idleTime = 0
+      , stopDisconnectingCount = 0
       }
-        ! []
+        ! [ Postgres.debug config.debug ]
     , Start
     , Stop
     )
 
 
-initClientState : ClientState
-initClientState =
-    ClientState Nothing Nothing Nothing
-
-
-getClientState : Model -> ClientId -> ClientState
-getClientState model clientId =
-    let
-        maybeClientState =
-            Dict.get clientId model.clients
-
-        crash =
-            case maybeClientState of
-                Nothing ->
-                    Debug.crash <| "Client id: " ++ (toString clientId) ++ " is not in state"
-
-                Just _ ->
-                    ""
-    in
-        maybeClientState ?= initClientState
-
-
-setClientField : ClientId -> (ClientState -> ClientState) -> Model -> Model
-setClientField clientId mutateClientState model =
-    let
-        clientState =
-            getClientState model clientId
-
-        newClients =
-            Dict.insert clientId (mutateClientState clientState) model.clients
-    in
-        { model | clients = newClients }
-
-
-setFatalError : ClientId -> String -> Model -> Model
-setFatalError clientId error =
-    setClientField clientId (\clientState -> { clientState | fatalError = Just error })
-
-
-setLastJson : ClientId -> String -> Model -> Model
-setLastJson clientId json =
-    setClientField clientId (\clientState -> { clientState | lastJson = Just json })
-
-
-setConnectionId : ClientId -> ConnectionId -> Model -> Model
-setConnectionId clientId connectionId =
-    setClientField clientId (\clientState -> { clientState | connectionId = Just connectionId })
-
-
-clearConnectionId : ClientId -> Model -> Model
-clearConnectionId clientId =
-    setClientField clientId (\clientState -> { clientState | connectionId = Nothing })
-
-
-respond : ClientId -> Model -> WSPort -> Response -> ( Model, Cmd Msg )
-respond clientId model wsPort =
-    (,) model << Websocket.send SendError Sent wsPort clientId
-
-
-getRequestId : String -> String
-getRequestId request =
-    case JD.decodeString (field "requestId" int) request of
-        Ok requestId ->
-            toString requestId
-
-        Err _ ->
-            "Missing request Id"
-
-
-respondMessageConfig : WSPort -> Maybe Bool -> Bool -> Maybe ( String, String ) -> Maybe String -> ResponseType -> ClientId -> Model -> ( Model, Cmd Msg )
-respondMessageConfig wsPort maybeSuccess unsolicited maybeKeyValuePair keysFormatted type_ clientId model =
-    let
-        clientState =
-            getClientState model clientId
-
-        unsolicitedMessage =
-            case unsolicited of
-                True ->
-                    ", \"unsolicited\": true"
-
-                False ->
-                    ""
-
-        typeMessage =
-            ", \"type\": \"" ++ type_ ++ "\""
-
-        successMessage success =
-            ", \"success\": "
-                ++ case success of
-                    True ->
-                        "true"
-
-                    False ->
-                        "false"
-
-        keyMessage =
-            maybeKeyValuePair
-                |?> (\( key, message ) -> (", \"" ++ key ++ "\": \"" ++ (jsonStringEscape message) ++ "\""))
-                ?= ""
-
-        responseFormatted =
-            ("{\"requestId\": " ++ (getRequestId <| clientState.lastJson ?= ""))
-                ++ typeMessage
-                ++ unsolicitedMessage
-                ++ (maybeSuccess |?> successMessage ?= "")
-                ++ (keysFormatted ?= keyMessage)
-                ++ "}"
-    in
-        respond clientId model wsPort responseFormatted
-
-
-respondErrorConfig : WSPort -> String -> ResponseType -> ClientId -> Model -> ( Model, Cmd Msg )
-respondErrorConfig wsPort message =
-    respondMessageConfig wsPort (Just False) False (Just ( "error", message )) Nothing
-
-
-respondUnsolicitedConfig : WSPort -> String -> String -> ResponseType -> ClientId -> Model -> ( Model, Cmd Msg )
-respondUnsolicitedConfig wsPort key message =
-    respondMessageConfig wsPort Nothing True (Just ( key, message )) Nothing
-
-
-respondSimpleSuccessConfig : WSPort -> ResponseType -> ClientId -> Model -> ( Model, Cmd Msg )
-respondSimpleSuccessConfig wsPort =
-    respondMessageConfig wsPort (Just True) False Nothing Nothing
+getClientModel : ClientId -> Model -> Maybe Client.Model
+getClientModel clientId model =
+    Dict.get clientId model.clients
 
 
 delayMsg : Msg -> Time -> Cmd Msg
@@ -274,296 +129,284 @@ delayMsg msg delay =
     Task.perform (\_ -> msg) <| Process.sleep delay
 
 
+msgToCmd : msg -> Cmd msg
+msgToCmd msg =
+    Task.perform identity <| Task.succeed msg
+
+
 {-| PGProxy Msgs -
 -}
 type Msg
-    = Nop
+    = Tick Time
     | Start
     | Stop
     | DelayedStop
+    | Stopped
     | ConnectionStatus ( WSPort, Path, ClientId, IPAddress, ConnectionStatus )
+    | ClientError ( ErrorType, String )
+    | ClientLog ( LogLevel, String )
     | ListenError ( WSPort, Path, String )
-    | WSMessage ( ClientId, QueryString, String )
-    | SendError ( WSPort, ClientId, String )
+    | SendError ( WSPort, ClientId, String, String )
     | Sent ( WSPort, ClientId, String )
-    | PGConnectError ClientId ( ConnectionId, String )
-    | PGConnected ClientId ConnectionId
-    | PGConnectionLost ClientId ( ConnectionId, String )
-    | PGDisconnectError ClientId ( ConnectionId, String )
-    | PGDisconnected ClientId ConnectionId
-    | PGExecuteSqlError ClientId ( ConnectionId, String )
-    | PGExecuteSqlSuccess ClientId ( ConnectionId, Int )
-    | PGQueryError String ClientId ( ConnectionId, String )
-    | PGQuerySuccess String ClientId ( ConnectionId, List String )
-    | PGListenError ClientId ListenUnlisten ( ConnectionId, String )
-    | PGListenSuccess ClientId ( ConnectionId, ListenChannel, ListenUnlisten )
-    | PGListenEvent ClientId ( ConnectionId, ListenChannel, String )
-    | InternalDisconnectError ClientId ( ConnectionId, String )
-    | InternalDisconnected ClientId ConnectionId
+    | WSMessage ( ClientId, QueryString, String )
+    | ClientMsg ClientId Client.Msg
+    | ListenEvent (List ClientId) ( ConnectionId, ListenChannel, String )
+    | ClientDestroyed ClientId
 
 
 {-| PGProxy update
 -}
-update : Config msg -> Msg -> Model -> ( ( Model, Cmd Msg ), List msg )
-update config msg model =
+update : Config sessionModel msg -> Msg -> ( Model, sessionModel ) -> ( ( ( Model, sessionModel ), Cmd Msg ), List msg )
+update config msg ( model, sessionModel ) =
     let
-        removeClient clientId model =
-            let
-                newListens =
-                    (Dict.keys model.listens)
-                        |> List.filter (\( id, _ ) -> id == clientId)
-                        |> List.foldl (\key listens -> Dict.remove key listens) model.listens
-            in
-                { model
-                    | clients = Dict.remove clientId model.clients
-                    , listens = newListens
-                }
+        withSessionModel sessionModel ( ( model, cmd ), msgs ) =
+            ( ( ( model, sessionModel ), cmd ), msgs )
 
-        respondMessage =
-            respondMessageConfig config.wsPort
+        debugMsg =
+            case msg of
+                Tick _ ->
+                    msg
 
-        respondError =
-            respondErrorConfig config.wsPort
+                ClientLog _ ->
+                    msg
 
-        respondUnsolicited =
-            respondUnsolicitedConfig config.wsPort
+                ClientError _ ->
+                    msg
 
-        respondSimpleSuccess =
-            respondSimpleSuccessConfig config.wsPort
-    in
-        case msg of
-            Nop ->
-                ( model ! [], [] )
+                _ ->
+                    config.debug ? ( Debug.log "*** DEBUG:PGProxy msg" msg, msg )
 
-            Start ->
-                ( { model | running = Running } ! [], [ config.startedMsg ] )
-
-            Stop ->
-                ( { model | running = NotRunning } ! [ delayMsg DelayedStop 5000 ], [] )
-
-            DelayedStop ->
-                let
-                    newModel =
-                        List.foldl (\clientId model -> removeClient clientId model) model <| Dict.keys model.clients
-                in
-                    ( newModel ! [], [ config.stoppedMsg ] )
-
-            ConnectionStatus ( wsPort, path, clientId, ipAddress, status ) ->
-                let
-                    logCmd =
-                        config.logTagger <| ( LogLevelInfo, String.join " " [ toString status, "from ipAddress: ", ipAddress, " on port: ", toString wsPort, " on path: ", toString path, " for clientId: ", toString clientId ] )
-                in
-                    ( (case status of
-                        Connected ->
-                            { model | clients = Dict.insert clientId initClientState model.clients } ! []
-
-                        Disconnected ->
-                            let
-                                maybeConnectionId =
-                                    Dict.get clientId model.clients
-                                        |?> .connectionId
-                                        ?= Nothing
-
-                                pgDisconnect =
-                                    maybeConnectionId
-                                        |?> (\connectionId -> Postgres.disconnect (InternalDisconnectError clientId) (InternalDisconnected clientId) connectionId True)
-                                        ?= Cmd.none
-                            in
-                                removeClient clientId model ! [ pgDisconnect ]
-                      )
-                    , [ logCmd ]
+        destroyClients model clientIdAndModels =
+            clientIdAndModels
+                |> List.foldl
+                    (\( clientId, clientModel ) ( ( model, connectionManagerModel ), cmds, previousMsgs ) ->
+                        Client.destroyDisconnected (clientConfig config) ( clientModel, connectionManagerModel ) (ClientMsg clientId)
+                            |> (\( ( ( clientModel, connectionManagerModel ), cmd ), msgs ) -> ( ( { model | clients = Dict.insert clientId clientModel model.clients }, connectionManagerModel ), cmd :: cmds, List.append previousMsgs msgs ))
                     )
+                    ( ( model, model.connectionManagerModel ), [], [] )
+                |> (\( ( model, connectionManagerModel ), cmds, myMsgs ) ->
+                        { model | connectionManagerModel = connectionManagerModel }
+                            |> (\model ->
+                                    myMsgs
+                                        |> List.foldl
+                                            (\msg ( ( model, sessionModel ), cmds, previousMsgs ) ->
+                                                update config msg ( model, sessionModel )
+                                                    |> (\( ( ( model, sessionModel ), cmd ), msgs ) -> ( ( model, sessionModel ), cmd :: cmds, List.append previousMsgs msgs ))
+                                            )
+                                            ( ( model, sessionModel ), cmds, [] )
+                                        |> (\( ( model, sessionModel ), cmds, msgs ) -> ( ( model, sessionModel ) ! cmds, msgs ))
+                               )
+                   )
 
-            InternalDisconnectError clientId ( connectionId, error ) ->
-                ( model ! [], [ config.errorTagger <| ( NonFatalError, "Internal Disconnect Error: " ++ toString ( clientId, connectionId, error ) ) ] )
+        updateClient clientId clientModel =
+            updateChildParent (Client.update (clientConfig config))
+                (update config)
+                (\( model, _ ) -> ( clientModel, model.connectionManagerModel ))
+                (ClientMsg clientId)
+                (\( model, sessionModel ) ( clientModel, connectionManagerModel ) -> ( { model | clients = Dict.insert clientId clientModel model.clients, connectionManagerModel = connectionManagerModel }, sessionModel ))
 
-            InternalDisconnected clientId connectionId ->
-                ( model ! [], [ config.logTagger <| ( LogLevelInfo, "Internal Disconnect Complete for clientId" ++ toString clientId ) ] )
+        debugDumpState model =
+            config.debug
+                ? ( (DebugF.toStringF model)
+                        |> cleanElmString
+                        |> DebugF.log "*** DEBUG:PGProxy model"
+                  , ""
+                  )
 
-            ListenError ( wsPort, path, error ) ->
-                ( { model | listenError = True } ! [], [ config.errorTagger ( FatalError, ("Unable to listen to websocket on port: " ++ (toString wsPort) ++ " for path: " ++ path ++ " error: " ++ error) ) ] )
+        debugDumpAllStates model =
+            config.debug
+                ? ( debugDumpState model
+                        |> (always Postgres.dumpState)
+                  , Cmd.none
+                  )
+    in
+        (case msg of
+            Tick _ ->
+                { model | idleTime = model.idleTime + tickPeriod }
 
-            SendError ( wsPort, clientId, error ) ->
-                let
-                    errorMsg =
-                        ("Unable to send to websocket on port: ") ++ (toString wsPort) ++ " for clientId: " ++ (toString clientId) ++ " error: " ++ error
-                in
-                    ( setFatalError clientId errorMsg model ! [], [ config.errorTagger ( NonFatalError, errorMsg ) ] )
+            _ ->
+                { model | idleTime = 0 }
+        )
+            |> (\model ->
+                    case msg of
+                        Tick time ->
+                            { model | currentTime = time }
+                                |> (\model ->
+                                        (((model.idleTime >= config.idleDumpStateFrequency) ?! ( \_ -> ( { model | idleTime = 0 }, debugDumpAllStates model ), \_ -> ( model, Cmd.none ) ))
+                                            |> (\( model, cmd ) -> ( model ! [ cmd ], [] ))
+                                            |> withSessionModel sessionModel
+                                        )
+                                            |> (\( ( ( model, sessionModel ), dumpCmd ), dumpMsgs ) ->
+                                                    model.clients
+                                                        |> Dict.toList
+                                                        |> List.filterMap (\( clientId, clientModel ) -> Client.disconnectedAt clientModel |?> (\disconnectedAt -> ( clientId, disconnectedAt )))
+                                                        |> (List.foldl
+                                                                (\( clientId, disconnectedAt ) ( model, cmds ) ->
+                                                                    (time - disconnectedAt >= config.garbageCollectDisconnectedClientsAfterPeriod)
+                                                                        ? ( ( model, (msgToCmd <| ClientDestroyed clientId) :: cmds )
+                                                                          , ( model, [] )
+                                                                          )
+                                                                )
+                                                                ( model, [ dumpCmd ] )
+                                                           )
+                                                        |> (\( model, cmds ) -> ( (( model, sessionModel ) ! cmds), dumpMsgs ))
+                                               )
+                                   )
 
-            Sent ( wsPort, clientId, message ) ->
-                ( model ! [], [] )
+                        Start ->
+                            ( { model | running = True } ! [], [ config.startedMsg <| Ok () ] )
+                                |> withSessionModel sessionModel
 
-            WSMessage ( clientId, _, json ) ->
-                let
-                    ( type_, decodeResult ) =
-                        decodeRequest json
+                        Stop ->
+                            ( { model | running = False } ! [ delayMsg DelayedStop config.delayBeforeStop ], [] )
+                                |> withSessionModel sessionModel
 
-                    request =
-                        decodeResult ??= (\err -> UnknownProxyRequest err)
+                        DelayedStop ->
+                            Dict.toList model.clients
+                                |> (\clientIdAndModels ->
+                                        (clientIdAndModels == [])
+                                            ?! ( (\_ -> update config Stopped ( model, sessionModel ))
+                                               , (\_ ->
+                                                    clientIdAndModels
+                                                        |> List.map (Tuple.mapSecond (\clientModel -> Client.disconnected clientModel model.currentTime))
+                                                        |> destroyClients model
+                                                 )
+                                               )
+                                   )
 
-                    clientState =
-                        getClientState model clientId
+                        ClientDestroyed clientId ->
+                            { model | clients = Dict.remove clientId model.clients }
+                                |> (\model ->
+                                        (Dict.toList model.clients == [] && not model.running)
+                                            ?! ( (\_ -> update config Stopped ( model, sessionModel ))
+                                               , (\_ -> ( ( model, sessionModel ) ! [], [] ))
+                                               )
+                                   )
 
-                    {- If there is a fatal error for this client NO other requests can be honored -}
-                    ( newModel, cmd ) =
-                        clientState.fatalError
-                            |?> (\fatalError -> respondError fatalError type_ clientId model)
-                            ?= handleRequest config model clientId json request clientState
-                in
-                    ( setLastJson clientId json newModel ! [ cmd ], [] )
+                        Stopped ->
+                            ( model ! [], [ config.stoppedMsg <| Ok () ] )
+                                |> withSessionModel sessionModel
+                                |> (\( ( ( model, sessionModel ), cmd ), msgs ) -> ( ( model, sessionModel ) ! [ debugDumpAllStates model, cmd ], msgs ))
 
-            PGConnectError clientId ( connectionId, error ) ->
-                ( respondError error "connect" clientId model, [] )
+                        ConnectionStatus ( wsPort, path, clientId, ipAddress, status ) ->
+                            config.logTagger ( LogLevelDebug, String.join " " [ toString status, "from ipAddress: ", ipAddress, " on port: ", toString wsPort, " on path: ", toString path, " for clientId: ", toString clientId ] )
+                                |> (\logMsg ->
+                                        case status of
+                                            Connected ->
+                                                ( { model | clients = Dict.insert clientId (Client.init clientId) model.clients } ! [], [ logMsg ] )
+                                                    |> withSessionModel sessionModel
 
-            PGConnected clientId connectionId ->
-                ( respondSimpleSuccess "connect" clientId (setConnectionId clientId connectionId model), [] )
+                                            Disconnected ->
+                                                getClientModel clientId model
+                                                    |?> (\clientModel ->
+                                                            model.clients
+                                                                |> Dict.filter (\dictClientId _ -> dictClientId == clientId)
+                                                                |> Dict.toList
+                                                                |> List.map (Tuple.mapSecond (\clientModel -> Client.disconnected clientModel model.currentTime))
+                                                                |> destroyClients model
+                                                                |> (\( ( ( model, sessionModel ), cmd ), msgs ) -> ( ( model, sessionModel ) ! [ cmd ], List.append [ logMsg ] msgs ))
+                                                        )
+                                                    ?= ( ( model, sessionModel ) ! [], [] )
+                                   )
 
-            PGConnectionLost clientId ( connectionId, error ) ->
-                ( respondUnsolicited "connectionLostError" error "connect" clientId model, [] )
+                        ClientError ( errorType, error ) ->
+                            ( model ! [], [ config.errorTagger ( errorType, "Client:" +-+ error ) ] )
+                                |> withSessionModel sessionModel
 
-            PGDisconnectError clientId ( connectionId, error ) ->
-                ( respondError error "disconnect" clientId model, [] )
+                        ClientLog ( logLevel, message ) ->
+                            ( model ! [], [ config.logTagger ( logLevel, "Client:" +-+ message ) ] )
+                                |> withSessionModel sessionModel
 
-            PGDisconnected clientId connectionId ->
-                ( respondSimpleSuccess "disconnect" clientId (clearConnectionId clientId model), [] )
+                        ListenError ( wsPort, path, error ) ->
+                            ( { model | listenError = True } ! [], [ config.errorTagger ( FatalError, ("Unable to listen to websocket on port:" +-+ wsPort +-+ "for path:" +-+ path +-+ "error:" +-+ error) ) ] )
+                                |> withSessionModel sessionModel
 
-            PGExecuteSqlError clientId ( connectionId, error ) ->
-                ( respondError error "executeSql" clientId model, [] )
+                        SendError ( wsPort, clientId, message, error ) ->
+                            ("Unable to send:" +-+ message +-+ "to websocket on port:" +-+ wsPort +-+ "for clientId:" +-+ clientId +-+ "error:" +-+ error)
+                                |> (\errorMsg ->
+                                        ( model ! [], [ config.errorTagger ( NonFatalError, errorMsg ) ] )
+                                            |> withSessionModel sessionModel
+                                   )
 
-            PGExecuteSqlSuccess clientId ( connectionId, count ) ->
-                ( respondMessage (Just True) False (Just ( "count", toString count )) Nothing "executeSql" clientId model, [] )
+                        Sent ( wsPort, clientId, message ) ->
+                            (config.debug ? ( Debug.log "*** DEBUG:PGProxy <--- SENT ---<<<" ( clientId, message ), ( clientId, message ) ))
+                                |> always (( model ! [], [] ) |> withSessionModel sessionModel)
 
-            PGQueryError type_ clientId ( connectionId, error ) ->
-                ( respondError error type_ clientId model, [] )
+                        WSMessage ( clientId, _, request ) ->
+                            model.running
+                                ? ( (config.debug ? ( Debug.log "*** DEBUG:PGProxy >>>- RECEIVED --->" ( clientId, request ), ( clientId, request ) ))
+                                        |> always
+                                            (decodeRequest request
+                                                |> (\( type_, decodeResult ) ->
+                                                        ( decodeResult ??= (\err -> UnknownProxyRequest err), Dict.get clientId model.clients )
+                                                            |> (\( proxyRequest, maybeClientModel ) ->
+                                                                    maybeClientModel
+                                                                        |?> (\clientModel ->
+                                                                                (config.authenticate sessionModel <| getSessionId request)
+                                                                                    |> (\( sessionModel, authenticated ) ->
+                                                                                            authenticated
+                                                                                                ? ( getClientModel clientId model
+                                                                                                        |?> (\clientModel -> updateClient clientId clientModel (Client.Request proxyRequest request) ( model, sessionModel ))
+                                                                                                        ?= (( model ! [], [] ) |> withSessionModel sessionModel)
+                                                                                                  , (( model ! [ respondError SendError Sent config.wsPort Error.invalidSession clientId request ], [] )
+                                                                                                        |> withSessionModel sessionModel
+                                                                                                    )
+                                                                                                  )
+                                                                                       )
+                                                                            )
+                                                                        ?= (( model ! [ respondError SendError Sent config.wsPort Error.invalidSession clientId request ], [] )
+                                                                                |> withSessionModel sessionModel
+                                                                           )
+                                                               )
+                                                   )
+                                            )
+                                  , ( model ! [], [ config.logTagger ( LogLevelInfo, "Ignoring request:" +-+ request +-+ "since shutting down" ) ] )
+                                        |> withSessionModel sessionModel
+                                  )
 
-            PGQuerySuccess type_ clientId ( connectionId, results ) ->
-                let
-                    formatRecords records =
-                        let
-                            quote s =
-                                "\"" ++ s ++ "\""
-                        in
-                            ", \"records\": [" ++ (String.join ", " <| List.map (quote << jsonStringEscape) records) ++ "]"
-                in
-                    ( respondMessage (Just True) False Nothing (Just <| formatRecords results) type_ clientId model, [] )
+                        ListenEvent clientIds ( connectionId, channel, message ) ->
+                            clientIds
+                                |> List.filterMap
+                                    (\clientId ->
+                                        getClientModel clientId model
+                                            |?> (\clientModel -> Just ( clientId, clientModel ))
+                                            ?= Nothing
+                                    )
+                                |> List.map (\( clientId, clientModel ) -> Client.notify (clientConfig config) clientModel (ClientMsg clientId) message)
+                                |> (\cmds -> ( model ! cmds, [] ))
+                                |> withSessionModel sessionModel
 
-            PGListenError clientId listenErrorType ( connectionId, error ) ->
-                let
-                    type_ =
-                        case listenErrorType of
-                            ListenType ->
-                                "listen"
-
-                            UnlistenType ->
-                                "unlisten"
-                in
-                    ( respondError error type_ clientId model, [] )
-
-            PGListenSuccess clientId ( connectionId, channel, type_ ) ->
-                case type_ of
-                    ListenType ->
-                        ( respondSimpleSuccess "listen" clientId model, [] )
-
-                    UnlistenType ->
-                        ( respondSimpleSuccess "unlisten" clientId model, [] )
-
-            PGListenEvent clientId ( connectionId, channel, message ) ->
-                ( respondUnsolicited "notification" message "listen" clientId model, [] )
+                        ClientMsg clientId msg ->
+                            getClientModel clientId model
+                                |?> (\clientModel -> updateClient clientId clientModel msg ( model, sessionModel ))
+                                ?= (ConnectionManager.removeClient clientId model.connectionManagerModel
+                                        |> (\connectionManagerModel ->
+                                                ( { model | connectionManagerModel = connectionManagerModel } ! [], [ config.logTagger ( LogLevelInfo, "Ignoring message for non-existent clientId:" +-+ clientId ) ] )
+                                                    |> withSessionModel sessionModel
+                                           )
+                                   )
+               )
 
 
 getSessionId : String -> SessionId
 getSessionId json =
-    case JD.decodeString (field "sessionId" string) json of
-        Ok sessionId ->
-            sessionId
-
-        Err _ ->
-            "Missing session Id"
-
-
-handleRequest : Config msg -> Model -> ClientId -> String -> ProxyRequest -> ClientState -> ( Model, Cmd Msg )
-handleRequest config model clientId json request clientState =
-    let
-        respondError =
-            respondErrorConfig config.wsPort
-
-        connectionId =
-            clientState.connectionId ?= -1
-
-        withConnectionId clientId model type_ cmd =
-            case connectionId of
-                -1 ->
-                    respondError "Connection does not exist" type_ clientId model
-
-                _ ->
-                    ( model, cmd )
-
-        handle running =
-            case running of
-                NotRunning ->
-                    model ! []
-
-                Running ->
-                    case request of
-                        Connect connectionRequest ->
-                            ( model, Postgres.connect (PGConnectError clientId) (PGConnected clientId) (PGConnectionLost clientId) pgConnectTimeout connectionRequest.host connectionRequest.port_ connectionRequest.database connectionRequest.user connectionRequest.password )
-
-                        Disconnect disconnectionRequest ->
-                            withConnectionId clientId model "disconnect" <| Postgres.disconnect (PGDisconnectError clientId) (PGDisconnected clientId) connectionId disconnectionRequest.discardConnection
-
-                        Query queryRequest ->
-                            withConnectionId clientId model "query" <| Postgres.query (PGQueryError "query" clientId) (PGQuerySuccess "query" clientId) connectionId queryRequest.sql queryRequest.recordCount
-
-                        MoreQueryResults moreQueryResultsRequest ->
-                            withConnectionId clientId model "moreQueryResults" <| Postgres.moreQueryResults (PGQueryError "moreQueryResults" clientId) (PGQuerySuccess "moreQueryResults" clientId) connectionId
-
-                        ExecuteSql executeSqlRequest ->
-                            withConnectionId clientId model "executeSql" <| Postgres.executeSql (PGExecuteSqlError clientId) (PGExecuteSqlSuccess clientId) connectionId executeSqlRequest.sql
-
-                        Listen listenRequest ->
-                            let
-                                sub =
-                                    Postgres.listen (PGListenError clientId ListenType) (PGListenSuccess clientId) (PGListenEvent clientId) connectionId listenRequest.channel
-
-                                ( finalModel, cmd ) =
-                                    Dict.get ( clientId, listenRequest.channel ) model.listens
-                                        |?> (\_ -> respondError ("Listen already exists for Channel: " ++ listenRequest.channel) "listen" clientId model)
-                                        ?= ( { model | listens = Dict.insert ( clientId, listenRequest.channel ) sub model.listens }, Cmd.none )
-                            in
-                                withConnectionId clientId finalModel "listen" cmd
-
-                        Unlisten unlistenRequest ->
-                            let
-                                ( finalModel, cmd ) =
-                                    Dict.get ( clientId, unlistenRequest.channel ) model.listens
-                                        |?> (\_ -> ( { model | listens = Dict.remove ( clientId, unlistenRequest.channel ) model.listens }, Cmd.none ))
-                                        ?= respondError ("Listen does not exists for Channel: " ++ unlistenRequest.channel) "unlisten" clientId model
-                            in
-                                withConnectionId clientId finalModel "unlisten" cmd
-
-                        UnknownProxyRequest error ->
-                            respondError ("Unknown request: " ++ json ++ " Error: " ++ error) "unknown" clientId model
-    in
-        case config.authenticate <| getSessionId json of
-            True ->
-                handle model.running
-
-            False ->
-                respondError "Invalid session" "unknown" clientId model
+    JD.decodeString (field "sessionId" string) json ??= always Error.invalidSession
 
 
 {-| subscriptions
 -}
-subscriptions : Config msg -> Model -> Sub Msg
+subscriptions : Config sessionModel msg -> Model -> Sub Msg
 subscriptions config model =
-    case model.running of
-        Running ->
-            case not model.listenError of
-                True ->
-                    Sub.batch <| Websocket.listen ListenError WSMessage ConnectionStatus config.wsPort path :: Dict.values model.listens
-
-                False ->
-                    Sub.none
-
-        NotRunning ->
-            Sub.none
+    Websocket.listen ListenError WSMessage ConnectionStatus config.wsPort config.path
+        |> (\websocketSub ->
+                Sub.batch
+                    [ Time.every tickPeriod Tick
+                    , model.running
+                        ? ( model.listenError
+                                ? ( Sub.none
+                                  , Sub.batch <| websocketSub :: (List.map (\( clientId, subscription ) -> Sub.map (ClientMsg clientId) subscription) <| ConnectionManager.subscriptions model.connectionManagerModel)
+                                  )
+                          , websocketSub
+                          )
+                    ]
+           )

@@ -14,6 +14,14 @@
 
 > Communication between client and server uses Websockets using the client library [elm-websocket-browser](https://github.com/panosoft/elm-websocket-browser) and the server library [elm-websocket-server](https://github.com/panosoft/elm-websocket-server)
 
+## Efficiencies
+
+As of version 4.0.0, PGProxy supports Listen Connection Sharing. Since queries and writes to and from the database from clients can be done over short-lived connections, there is no need to share those connections. Since connection pooling is supported by the Postgres Effects Manager, short-lived connections can be employed efficiently.
+
+However, this is not the case with Listens. Those connection must be long-lived and could create too many connections from all of the clients of the database.
+
+Therefore, PGProxy now supports Connection Sharing for Listens. This is done internally and doesn't require any additional Client logic, but does inforce a restriction. Listens MUST have their own connections. If you want to reuse a Listen connection, you may, but only after you stop listening, i.e. get a successful Unlisten event.
+
 ## Protocol
 
 ### Requests
