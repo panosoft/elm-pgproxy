@@ -4,6 +4,7 @@ module ConnectionManager
         , Config
         , Msg
         , init
+        , stop
         , update
         , getConnectRequestMustExist
         , getConnectionId
@@ -30,22 +31,24 @@ import Utils.Ops exposing (..)
 import Utils.Record exposing (..)
 import Utils.Log exposing (..)
 import Utils.Error exposing (..)
-import Services.Common.Taggers exposing (..)
+import Services.Common.Taggers as ServicesCommon exposing (..)
+import DebugF exposing (..)
 
 
 type alias Config msg =
     { routeToMeTagger : Msg -> msg
     , pgConnectTimeout : Time
-    , errorTagger : ErrorTagger String msg
+    , errorTagger : ServicesCommon.ErrorTagger String msg
     , logTagger : LogTagger String msg
     , connectErrorTagger : Request -> String -> msg
     , connectedTagger : Request -> msg
     , connectionLostTagger : ConnectionId -> String -> msg
-    , disconnectErrorTagger : Request -> ( ConnectionId, String ) -> msg
-    , disconnectedTagger : Request -> ConnectionId -> msg
+    , disconnectErrorTagger : Maybe Request -> ( ConnectionId, String ) -> msg
+    , disconnectedTagger : Maybe Request -> ConnectionId -> msg
     , listenUnlistenErrorTagger : Request -> ( ConnectionId, String ) -> msg
     , listenUnlistenSuccessTagger : Request -> ( ConnectionId, ListenChannel, ListenUnlisten ) -> msg
     , listenEventTagger : List ClientId -> ( ConnectionId, ListenChannel, String ) -> msg
+    , debug : Bool
     }
 
 
@@ -65,7 +68,8 @@ type alias SharedListenConnection msg =
 
 
 type alias Model msg =
-    { connectRequests : Dict ClientId ( ConnectRequest, Request )
+    { running : Bool
+    , connectRequests : Dict ClientId ( ConnectRequest, Request )
     , connectionIds : Dict ClientId ConnectionId
     , sharedListenConnections : Dict ( ConnectRequestStr, ListenChannel ) (SharedListenConnection msg)
     }
@@ -73,10 +77,16 @@ type alias Model msg =
 
 init : Model msg
 init =
-    { connectRequests = Dict.empty
+    { running = True
+    , connectRequests = Dict.empty
     , connectionIds = Dict.empty
     , sharedListenConnections = Dict.empty
     }
+
+
+stop : Model msg -> Model msg
+stop model =
+    { model | running = False }
 
 
 msgToCmd : msg -> Cmd msg
@@ -88,8 +98,8 @@ type Msg
     = ConnectError Request ( ConnectionId, String )
     | Connected ClientId Request ConnectionId
     | ConnectionLost Request ( ConnectionId, String )
-    | DisconnectError Request ( ConnectionId, String )
-    | Disconnected Request ConnectionId
+    | DisconnectError (Maybe Request) ( ConnectionId, String )
+    | Disconnected (Maybe Request) ConnectionId
     | InternalListenDisconnectError Request ( ConnectionId, String )
     | InternalListenDisconnected Request ListenChannel ConnectionId ConnectionId
     | ListenUnlistenError Request ( ConnectionId, String )
@@ -101,60 +111,64 @@ type Msg
 
 update : Config msg -> Msg -> Model msg -> ( ( Model msg, Cmd Msg ), List msg )
 update config msg model =
-    (\error -> config.errorTagger ( NonFatalError, "Unable to disconnect:" +-+ error ))
-        |> (\disconnectError ->
-                case msg of
-                    ConnectError request ( connectionId, error ) ->
-                        ( { model | connectRequests = Dict.remove connectionId model.connectRequests } ! [], [ config.connectErrorTagger request error ] )
+    (config.debug ? ( DebugF.logFC Magenta Black "*** DEBUG:PGProxy ConnectionManager msg" (cleanElmString <| toString msg), "" ))
+        |> (\_ ->
+                ((\error -> config.errorTagger ( NonFatalError, "Unable to disconnect:" +-+ error ))
+                    |> (\disconnectError ->
+                            case msg of
+                                ConnectError request ( connectionId, error ) ->
+                                    ( { model | connectRequests = Dict.remove connectionId model.connectRequests } ! [], [ config.connectErrorTagger request error ] )
 
-                    Connected clientId request connectionId ->
-                        Dict.get clientId model.connectRequests
-                            |?> (\_ -> ( createConnection clientId connectionId model ! [], [ config.logTagger ( LogLevelDebug, "Created New Connection:" +-+ ( clientId, connectionId ) ), config.connectedTagger request ] ))
-                            ?= (disconnectInternal config clientId connectionId True request model
-                                    |> (\( ( model, cmd ), msgs ) -> ( model ! [ cmd ], List.append msgs [ config.logTagger ( LogLevelDebug, "DESTROYED NewConnection:" +-+ ( clientId, connectionId ) ) ] ))
-                               )
-
-                    ConnectionLost request ( connectionId, error ) ->
-                        destroyConnection connectionId model
-                            |> (\model -> ( model ! [], [ config.connectionLostTagger connectionId error ] ))
-
-                    DisconnectError request ( connectionId, error ) ->
-                        ( model ! [], [ disconnectError error, config.disconnectErrorTagger request ( connectionId, error ) ] )
-
-                    Disconnected request connectionId ->
-                        ( destroyConnection connectionId model ! [], [ config.disconnectedTagger request connectionId ] )
-
-                    InternalListenDisconnectError request ( connectionId, error ) ->
-                        ( model ! [], [ config.listenUnlistenErrorTagger request ( connectionId, error ), disconnectError error ] )
-
-                    InternalListenDisconnected request channel newConnectionId oldConnectionId ->
-                        ( model ! [], [ config.logTagger ( LogLevelDebug, "Internally disconnected connectionId:" +-+ oldConnectionId ) ] )
-
-                    ListenUnlistenError request ( connectionId, error ) ->
-                        ( model ! [], [ config.listenUnlistenErrorTagger request ( connectionId, error ) ] )
-
-                    ListenUnlistenSuccess request ( connectionId, channel, listenUnlisten ) ->
-                        ( model ! [], [ config.listenUnlistenSuccessTagger request ( connectionId, channel, listenUnlisten ) ] )
-
-                    ListenEvent ( listenConnectionId, channel, message ) ->
-                        (model.connectionIds
-                            |> Dict.filter (\_ connectionId -> connectionId == listenConnectionId)
-                            |> Dict.keys
-                        )
-                            |> (\clientIds -> ( model ! [], [ config.listenEventTagger clientIds ( listenConnectionId, channel, message ) ] ))
-
-                    InternalUnlistenConnectError request ( connectionId, error ) ->
-                        ( model ! [], [ config.listenUnlistenErrorTagger request ( connectionId, error ) ] )
-
-                    InternalUnlistenConnected request clientId ( connectRequestStr, channel ) connectionId ->
-                        { model | sharedListenConnections = Dict.remove ( connectRequestStr, channel ) model.sharedListenConnections }
-                            |> (\model ->
+                                Connected clientId request connectionId ->
                                     Dict.get clientId model.connectRequests
-                                        |?> (\_ -> ( createConnection clientId connectionId model ! [], [ config.logTagger ( LogLevelDebug, "Created New Connection:" +-+ ( clientId, connectionId ) ), config.listenUnlistenSuccessTagger request ( connectionId, channel, UnlistenType ) ] ))
-                                        ?= (disconnectInternal config clientId connectionId True request model
+                                        |?> (\_ -> ( createConnection clientId connectionId model ! [], [ config.logTagger ( LogLevelDebug, "Created New Connection:" +-+ ( clientId, connectionId ) ), config.connectedTagger request ] ))
+                                        ?= (disconnectInternal config clientId connectionId True (Just request) model
                                                 |> (\( ( model, cmd ), msgs ) -> ( model ! [ cmd ], List.append msgs [ config.logTagger ( LogLevelDebug, "DESTROYED NewConnection:" +-+ ( clientId, connectionId ) ) ] ))
                                            )
-                               )
+
+                                ConnectionLost request ( connectionId, error ) ->
+                                    destroyConnection connectionId model
+                                        |> (\model -> ( model ! [], [ config.connectionLostTagger connectionId error ] ))
+
+                                DisconnectError maybeRequest ( connectionId, error ) ->
+                                    ( model ! [], [ disconnectError error, config.disconnectErrorTagger maybeRequest ( connectionId, error ) ] )
+
+                                Disconnected maybeRequest connectionId ->
+                                    ( destroyConnection connectionId model ! [], [ config.disconnectedTagger maybeRequest connectionId ] )
+
+                                InternalListenDisconnectError request ( connectionId, error ) ->
+                                    ( model ! [], [ config.listenUnlistenErrorTagger request ( connectionId, error ), disconnectError error ] )
+
+                                InternalListenDisconnected request channel newConnectionId oldConnectionId ->
+                                    ( model ! [], [ config.logTagger ( LogLevelDebug, "Internally disconnected connectionId:" +-+ oldConnectionId ) ] )
+
+                                ListenUnlistenError request ( connectionId, error ) ->
+                                    ( model ! [], [ config.listenUnlistenErrorTagger request ( connectionId, error ) ] )
+
+                                ListenUnlistenSuccess request ( connectionId, channel, listenUnlisten ) ->
+                                    ( model ! [], [ config.listenUnlistenSuccessTagger request ( connectionId, channel, listenUnlisten ) ] )
+
+                                ListenEvent ( listenConnectionId, channel, message ) ->
+                                    (model.connectionIds
+                                        |> Dict.filter (\_ connectionId -> connectionId == listenConnectionId)
+                                        |> Dict.keys
+                                    )
+                                        |> (\clientIds -> ( model ! [], [ config.listenEventTagger clientIds ( listenConnectionId, channel, message ) ] ))
+
+                                InternalUnlistenConnectError request ( connectionId, error ) ->
+                                    ( model ! [], [ config.listenUnlistenErrorTagger request ( connectionId, error ) ] )
+
+                                InternalUnlistenConnected request clientId ( connectRequestStr, channel ) connectionId ->
+                                    { model | sharedListenConnections = Dict.remove ( connectRequestStr, channel ) model.sharedListenConnections }
+                                        |> (\model ->
+                                                Dict.get clientId model.connectRequests
+                                                    |?> (\_ -> ( createConnection clientId connectionId model ! [], [ config.logTagger ( LogLevelDebug, "Created New Connection:" +-+ ( clientId, connectionId ) ), config.listenUnlistenSuccessTagger request ( connectionId, channel, UnlistenType ) ] ))
+                                                    ?= (disconnectInternal config clientId connectionId True (Just request) model
+                                                            |> (\( ( model, cmd ), msgs ) -> ( model ! [ cmd ], List.append msgs [ config.logTagger ( LogLevelDebug, "DESTROYED NewConnection:" +-+ ( clientId, connectionId ) ) ] ))
+                                                       )
+                                           )
+                       )
+                )
            )
 
 
@@ -223,16 +237,16 @@ reconnectCommon reconnectCallback config channel clientId listenUnlistenRequest 
            )
 
 
-disconnectInternal : Config msg -> ClientId -> ConnectionId -> Bool -> Request -> Model msg -> ( ( Model msg, Cmd Msg ), List msg )
-disconnectInternal config clientId connectionId discardConnection request model =
+disconnectInternal : Config msg -> ClientId -> ConnectionId -> Bool -> Maybe Request -> Model msg -> ( ( Model msg, Cmd Msg ), List msg )
+disconnectInternal config clientId connectionId discardConnection maybeRequest model =
     (List.length (getSharedClientIds clientId model) == 1)
-        ? ( ( model ! [ Postgres.disconnect (DisconnectError request) (Disconnected request) connectionId discardConnection ], [ config.logTagger ( LogLevelDebug, "disconnect LAST, ClientId:" +-+ clientId ) ] )
+        ? ( ( model ! [ Postgres.disconnect (DisconnectError maybeRequest) (Disconnected maybeRequest) connectionId discardConnection ], [ config.logTagger ( LogLevelDebug, "Disconnect LAST, ClientId:" +-+ clientId ) ] )
           , ( { model
                 | connectRequests = Dict.remove clientId model.connectRequests
                 , connectionIds = Dict.remove clientId model.connectionIds
               }
                 ! []
-            , [ config.logTagger ( LogLevelDebug, "disconnect NOT LAST, ClientId:" +-+ clientId ), config.disconnectedTagger request connectionId ]
+            , [ config.logTagger ( LogLevelDebug, "Disconnect NOT LAST, ClientId:" +-+ clientId ), config.disconnectedTagger maybeRequest connectionId ]
             )
           )
 
@@ -300,9 +314,9 @@ removeClient clientId model =
     { model | connectRequests = Dict.remove clientId model.connectRequests, connectionIds = Dict.remove clientId model.connectionIds }
 
 
-disconnect : Config msg -> ClientId -> Bool -> Request -> Model msg -> ( ( Model msg, Cmd msg ), List msg )
-disconnect config clientId discardConnection request model =
-    disconnectInternal config clientId (getConnectionIdMustExist clientId model) discardConnection request model
+disconnect : Config msg -> ClientId -> Bool -> Maybe Request -> Model msg -> ( ( Model msg, Cmd msg ), List msg )
+disconnect config clientId discardConnection maybeRequest model =
+    disconnectInternal config clientId (getConnectionIdMustExist clientId model) discardConnection maybeRequest model
         |> (\( ( model, cmd ), msgs ) -> ( model ! [ Cmd.map config.routeToMeTagger cmd ], msgs ))
 
 
@@ -337,7 +351,7 @@ unlisten =
                               , getConnectRequestMustExist clientId model
                                     |> (\( connectRequest, channel ) ->
                                             ( model
-                                                ! [ Cmd.map config.routeToMeTagger <| Postgres.connect (InternalUnlistenConnectError request) (InternalUnlistenConnected request clientId ( connectRequestStr, channel )) (ConnectionLost request) (round config.pgConnectTimeout) connectRequest.host connectRequest.port_ connectRequest.database connectRequest.user connectRequest.password ]
+                                                ! [ model.running ? ( Cmd.map config.routeToMeTagger <| Postgres.connect (InternalUnlistenConnectError request) (InternalUnlistenConnected request clientId ( connectRequestStr, channel )) (ConnectionLost request) (round config.pgConnectTimeout) connectRequest.host connectRequest.port_ connectRequest.database connectRequest.user connectRequest.password, Cmd.none ) ]
                                             , []
                                             )
                                        )

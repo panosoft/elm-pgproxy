@@ -4,6 +4,7 @@ module Client
         , Msg(..)
         , Config
         , init
+        , stop
         , update
         , destroyDisconnected
         , disconnected
@@ -24,23 +25,26 @@ import Utils.Ops exposing (..)
 import Utils.Log exposing (..)
 import Utils.Error exposing (..)
 import ConnectionManager
-import Services.Common.Taggers exposing (..)
+import Services.Common.Taggers as ServicesCommon exposing (..)
+import DebugF exposing (..)
 
 
 type alias Config msg =
     { wsPort : WSPort
     , pgConnectTimeout : Time
-    , errorTagger : ErrorTagger String msg
+    , errorTagger : ServicesCommon.ErrorTagger String msg
     , logTagger : LogTagger String msg
     , sendErrorTagger : ( WSPort, ClientId, String, String ) -> msg
     , sentTagger : ( WSPort, ClientId, String ) -> msg
     , clientDestroyedTagger : ClientId -> msg
     , listenEventTagger : List ClientId -> ( ConnectionId, ListenChannel, String ) -> msg
+    , debug : Bool
     }
 
 
 type alias Model =
-    { fatalError : Maybe String
+    { running : Bool
+    , fatalError : Maybe String
     , disconnectedAt : Maybe Time
     , clientId : ClientId
     , listenRequest : Request
@@ -49,15 +53,21 @@ type alias Model =
 
 init : ClientId -> Model
 init clientId =
-    { fatalError = Nothing
+    { running = True
+    , fatalError = Nothing
     , disconnectedAt = Nothing
     , clientId = clientId
     , listenRequest = ""
     }
 
 
-destroyedConnectionManagerConfig : (Request -> ConnectionId -> Msg) -> Config msg -> ConnectionManager.Config Msg
-destroyedConnectionManagerConfig disconnectedTagger config =
+stop : Model -> Model
+stop model =
+    { model | running = False }
+
+
+connectionManagerConfig : Config msg -> ConnectionManager.Config Msg
+connectionManagerConfig config =
     { routeToMeTagger = ConnectionManagerMsg
     , pgConnectTimeout = config.pgConnectTimeout
     , errorTagger = ConnectionManagerError
@@ -66,16 +76,12 @@ destroyedConnectionManagerConfig disconnectedTagger config =
     , connectedTagger = Connected
     , connectionLostTagger = ConnectionLost
     , disconnectErrorTagger = DisconnectError
-    , disconnectedTagger = disconnectedTagger
+    , disconnectedTagger = Disconnected
     , listenUnlistenErrorTagger = ListenUnlistenError
     , listenUnlistenSuccessTagger = ListenUnlistenSuccess
     , listenEventTagger = ListenEvent
+    , debug = config.debug
     }
-
-
-connectionManagerConfig : Config msg -> ConnectionManager.Config Msg
-connectionManagerConfig =
-    destroyedConnectionManagerConfig Disconnected
 
 
 msgToCmd : msg -> Cmd msg
@@ -108,9 +114,8 @@ type Msg
     | ConnectError Request String
     | Connected Request
     | ConnectionLost ConnectionId String
-    | DisconnectError Request ( ConnectionId, String )
-    | Disconnected Request ConnectionId
-    | DisconnectedDestroyed Request ConnectionId
+    | DisconnectError (Maybe Request) ( ConnectionId, String )
+    | Disconnected (Maybe Request) ConnectionId
     | ListenUnlistenError Request ( ConnectionId, String )
     | ListenUnlistenSuccess Request ( ConnectionId, ListenChannel, ListenUnlisten )
     | ListenEvent (List ClientId) ( ConnectionId, ListenChannel, String )
@@ -124,184 +129,195 @@ type Msg
 
 update : Config msg -> Msg -> ( Model, ConnectionManager.Model Msg ) -> ( ( ( Model, ConnectionManager.Model Msg ), Cmd Msg ), List msg )
 update config msg ( model, connectionManagerModel ) =
-    let
-        respondMessage =
-            Respond.respondMessage SendError Sent config.wsPort
+    (config.debug ? ( DebugF.logFC Magenta Black "*** DEBUG:PGProxy Client msg" (cleanElmString <| toString msg), "" ))
+        |> (\_ ->
+                (let
+                    respondMessage =
+                        model.running ? ( Respond.respondMessage SendError Sent config.wsPort, (\_ _ _ _ _ _ -> Cmd.none) )
 
-        respondError =
-            Respond.respondError SendError Sent config.wsPort
+                    respondError =
+                        model.running ? ( Respond.respondError SendError Sent config.wsPort, (\_ _ _ -> Cmd.none) )
 
-        respondSuccess =
-            Respond.respondSuccess SendError Sent config.wsPort
+                    respondSuccess =
+                        model.running ? ( Respond.respondSuccess SendError Sent config.wsPort, (\_ _ -> Cmd.none) )
 
-        listeningOnConnection request model =
-            ( model ! [ respondError ("Operation NOT allowed since connection is used for listening") model.clientId request ], [] )
+                    listeningOnConnection request model =
+                        ( model ! [ respondError ("Operation NOT allowed since connection is used for listening") model.clientId request ], [] )
 
-        alreadyListeningOnConnection request model =
-            ( model ! [ respondError ("Operation NOT allowed since connection is ALREADY used for listening") model.clientId request ], [] )
+                    alreadyListeningOnConnection request model =
+                        ( model ! [ respondError ("Operation NOT allowed since connection is ALREADY used for listening") model.clientId request ], [] )
 
-        notListeningToChannel request model =
-            ( model ! [ respondError ("Operation NOT allowed since connection is NOT listening to specified channel") model.clientId request ], [] )
+                    notListeningToChannel request model =
+                        ( model ! [ respondError ("Operation NOT allowed since connection is NOT listening to specified channel") model.clientId request ], [] )
 
-        notConnected request model =
-            ( model ! [ respondError ("Operation NOT allowed since not connected") model.clientId request ], [] )
+                    notConnected request model =
+                        ( model ! [ respondError ("Operation NOT allowed since not connected") model.clientId request ], [] )
 
-        updateConnectionManger =
-            updateChildParent (ConnectionManager.update (connectionManagerConfig config)) (update config) second ConnectionManagerMsg (\( model, _ ) connectionManagerModel -> ( model, connectionManagerModel ))
-    in
-        (\connectionManagerModel ( ( model, cmd ), msgs ) -> ( ( model, connectionManagerModel ) ! [ cmd ], msgs ))
-            |> (\withConnectionManagerModel ->
-                    case msg of
-                        SendError ( wsPort, clientId, message, error ) ->
-                            ( { model | fatalError = Just message } ! [], [ config.sendErrorTagger ( wsPort, clientId, message, error ) ] )
-                                |> withConnectionManagerModel connectionManagerModel
-
-                        Sent ( wsPort, clientId, message ) ->
-                            ( model ! [], [ config.sentTagger ( wsPort, clientId, message ) ] )
-                                |> withConnectionManagerModel connectionManagerModel
-
-                        ConnectionManagerError ( errorType, error ) ->
-                            ( model ! [], [ config.errorTagger ( errorType, "ConnectionManger:" +-+ error ) ] )
-                                |> withConnectionManagerModel connectionManagerModel
-
-                        ConnectionManagerLog ( logLevel, message ) ->
-                            ( model ! [], [ config.logTagger ( logLevel, "ConnectionManger:" +-+ message ) ] )
-                                |> withConnectionManagerModel connectionManagerModel
-
-                        ConnectionManagerMsg msg ->
-                            updateConnectionManger msg ( model, connectionManagerModel )
-
-                        ConnectError request error ->
-                            ( model ! [ respondError ("Unable to connect to database:" +-+ error) model.clientId request ], [] )
-                                |> withConnectionManagerModel connectionManagerModel
-
-                        Connected request ->
-                            ( model ! [ respondSuccess model.clientId request ], [] )
-                                |> withConnectionManagerModel connectionManagerModel
-
-                        ConnectionLost connectionId error ->
-                            ConnectionManager.getClientIdsAndRequests connectionId connectionManagerModel
-                                |> List.map (\( clientId, request ) -> respondError "Lost connection to database" model.clientId request)
-                                |> (\cmds -> ( model ! cmds, [] ))
-                                |> withConnectionManagerModel connectionManagerModel
-
-                        DisconnectError request ( connectionId, error ) ->
-                            ( model ! [ respondError ("Unable to disconnect to database:" +-+ error) model.clientId request ], [] )
-                                |> withConnectionManagerModel connectionManagerModel
-
-                        Disconnected request connectionId ->
-                            ( model ! [ respondSuccess model.clientId request ], [] )
-                                |> withConnectionManagerModel connectionManagerModel
-
-                        DisconnectedDestroyed _ _ ->
-                            update config Destroyed ( model, connectionManagerModel )
-
-                        ListenUnlistenError request ( connectionId, error ) ->
-                            ( model ! [ respondError error model.clientId request ], [] )
-                                |> withConnectionManagerModel connectionManagerModel
-
-                        ListenUnlistenSuccess request ( connectionId, channel, listenUnlisten ) ->
-                            ( model ! [ respondSuccess model.clientId request ], [] )
-                                |> withConnectionManagerModel connectionManagerModel
-
-                        PGExecuteSqlError request ( connectionId, error ) ->
-                            ( model ! [ respondError error model.clientId request ], [] )
-                                |> withConnectionManagerModel connectionManagerModel
-
-                        PGExecuteSqlSuccess request ( connectionId, count ) ->
-                            ( model ! [ respondMessage (Just True) False (Just ( "count", toString count )) Nothing model.clientId request ], [] )
-                                |> withConnectionManagerModel connectionManagerModel
-
-                        PGQueryError request ( connectionId, error ) ->
-                            ( model ! [ respondError error model.clientId request ], [] )
-                                |> withConnectionManagerModel connectionManagerModel
-
-                        PGQuerySuccess request ( connectionId, results ) ->
-                            (\records -> ", \"records\": [" ++ (String.join ", " <| List.map ((\s -> "\"" ++ s ++ "\"") << jsonStringEscape) records) ++ "]")
-                                |> (\formatRecords ->
-                                        ( model ! [ respondMessage (Just True) False Nothing (Just <| formatRecords results) model.clientId request ], [] )
+                    updateConnectionManger =
+                        updateChildParent (ConnectionManager.update (connectionManagerConfig config)) (update config) second ConnectionManagerMsg (\( model, _ ) connectionManagerModel -> ( model, connectionManagerModel ))
+                 in
+                    (\connectionManagerModel ( ( model, cmd ), msgs ) -> ( ( model, connectionManagerModel ) ! [ cmd ], msgs ))
+                        |> (\withConnectionManagerModel ->
+                                case msg of
+                                    SendError ( wsPort, clientId, message, error ) ->
+                                        ( { model | fatalError = Just message } ! [], [ config.sendErrorTagger ( wsPort, clientId, message, error ) ] )
                                             |> withConnectionManagerModel connectionManagerModel
-                                   )
 
-                        ListenEvent clientIds ( connectionId, channel, message ) ->
-                            ( model ! [], [ config.listenEventTagger clientIds ( connectionId, channel, message ) ] )
-                                |> withConnectionManagerModel connectionManagerModel
-
-                        Destroyed ->
-                            ( model ! [], [ config.clientDestroyedTagger model.clientId ] )
-                                |> withConnectionManagerModel connectionManagerModel
-
-                        Request proxyRequest request ->
-                            model.fatalError
-                                |?> (\error ->
-                                        ( model ! [ respondError ("Cannot honor request due to previous fatal error:" +-+ error) model.clientId request ], [] )
+                                    Sent ( wsPort, clientId, message ) ->
+                                        ( model ! [], [ config.sentTagger ( wsPort, clientId, message ) ] )
                                             |> withConnectionManagerModel connectionManagerModel
-                                    )
-                                ?= (case proxyRequest of
-                                        Connect connectRequest ->
-                                            ConnectionManager.connect (connectionManagerConfig config) connectRequest model.clientId request connectionManagerModel
-                                                |> withModel config model
 
-                                        Disconnect disconnectRequest ->
-                                            ConnectionManager.disconnect (connectionManagerConfig config) model.clientId disconnectRequest.discardConnection request connectionManagerModel
-                                                |> withModel config model
+                                    ConnectionManagerError ( errorType, error ) ->
+                                        ( model ! [], [ config.errorTagger ( errorType, "ConnectionManger:" +-+ error ) ] )
+                                            |> withConnectionManagerModel connectionManagerModel
 
-                                        Query queryRequest ->
-                                            ConnectionManager.isNonListenConnection model.clientId connectionManagerModel
-                                                ? ( ConnectionManager.getConnectionId model.clientId connectionManagerModel
-                                                        |?> (\connectionId -> ( model ! [ Postgres.query (PGQueryError request) (PGQuerySuccess request) connectionId queryRequest.sql queryRequest.recordCount ], [] ))
-                                                        ?= notConnected request model
-                                                  , listeningOnConnection request model
-                                                  )
-                                                |> withConnectionManagerModel connectionManagerModel
+                                    ConnectionManagerLog ( logLevel, message ) ->
+                                        ( model ! [], [ config.logTagger ( logLevel, "ConnectionManger:" +-+ message ) ] )
+                                            |> withConnectionManagerModel connectionManagerModel
 
-                                        MoreQueryResults moreQueryResultsRequest ->
-                                            ConnectionManager.isNonListenConnection model.clientId connectionManagerModel
-                                                ? ( ConnectionManager.getConnectionId model.clientId connectionManagerModel
-                                                        |?> (\connectionId -> ( model ! [ Postgres.moreQueryResults (PGQueryError request) (PGQuerySuccess request) connectionId ], [] ))
-                                                        ?= notConnected request model
-                                                  , listeningOnConnection request model
-                                                  )
-                                                |> withConnectionManagerModel connectionManagerModel
+                                    ConnectionManagerMsg msg ->
+                                        updateConnectionManger msg ( model, connectionManagerModel )
 
-                                        ExecuteSql executeSqlRequest ->
-                                            ConnectionManager.isNonListenConnection model.clientId connectionManagerModel
-                                                ? ( ConnectionManager.getConnectionId model.clientId connectionManagerModel
-                                                        |?> (\connectionId -> ( model ! [ Postgres.executeSql (PGExecuteSqlError request) (PGExecuteSqlSuccess request) connectionId executeSqlRequest.sql ], [] ))
-                                                        ?= notConnected request model
-                                                  , listeningOnConnection request model
-                                                  )
-                                                |> withConnectionManagerModel connectionManagerModel
+                                    ConnectError request error ->
+                                        ( model ! [ respondError ("Unable to connect to database:" +-+ error) model.clientId request ], [] )
+                                            |> withConnectionManagerModel connectionManagerModel
 
-                                        Listen listenRequest ->
-                                            { model | listenRequest = request }
-                                                |> (\model ->
+                                    Connected request ->
+                                        ( model ! [ respondSuccess model.clientId request ], [] )
+                                            |> withConnectionManagerModel connectionManagerModel
+
+                                    ConnectionLost connectionId error ->
+                                        ConnectionManager.getClientIdsAndRequests connectionId connectionManagerModel
+                                            |> List.map (\( clientId, request ) -> respondError "Lost connection to database" model.clientId request)
+                                            |> (\cmds -> ( model ! cmds, [] ))
+                                            |> withConnectionManagerModel connectionManagerModel
+
+                                    DisconnectError maybeRequest ( connectionId, error ) ->
+                                        model.running
+                                            ? ( maybeRequest
+                                                    |?> (\request -> ( model ! [ respondError ("Unable to disconnect from database:" +-+ error) model.clientId request ], [] ))
+                                                    ?= ( model ! [], [] )
+                                                    |> withConnectionManagerModel connectionManagerModel
+                                              , update config Destroyed ( model, connectionManagerModel )
+                                              )
+
+                                    Disconnected maybeRequest connectionId ->
+                                        model.running
+                                            ? ( maybeRequest
+                                                    |?> (\request -> ( model ! [ respondSuccess model.clientId request ], [] ))
+                                                    ?= ( model ! [], [] )
+                                                    |> withConnectionManagerModel connectionManagerModel
+                                              , update config Destroyed ( model, connectionManagerModel )
+                                              )
+
+                                    ListenUnlistenError request ( connectionId, error ) ->
+                                        ( model ! [ respondError error model.clientId request ], [] )
+                                            |> withConnectionManagerModel connectionManagerModel
+
+                                    ListenUnlistenSuccess request ( connectionId, channel, listenUnlisten ) ->
+                                        ( model ! [ respondSuccess model.clientId request ], [] )
+                                            |> withConnectionManagerModel connectionManagerModel
+
+                                    PGExecuteSqlError request ( connectionId, error ) ->
+                                        ( model ! [ respondError error model.clientId request ], [] )
+                                            |> withConnectionManagerModel connectionManagerModel
+
+                                    PGExecuteSqlSuccess request ( connectionId, count ) ->
+                                        ( model ! [ respondMessage (Just True) False (Just ( "count", toString count )) Nothing model.clientId request ], [] )
+                                            |> withConnectionManagerModel connectionManagerModel
+
+                                    PGQueryError request ( connectionId, error ) ->
+                                        ( model ! [ respondError error model.clientId request ], [] )
+                                            |> withConnectionManagerModel connectionManagerModel
+
+                                    PGQuerySuccess request ( connectionId, results ) ->
+                                        (\records -> ", \"records\": [" ++ (String.join ", " <| List.map ((\s -> "\"" ++ s ++ "\"") << jsonStringEscape) records) ++ "]")
+                                            |> (\formatRecords ->
+                                                    ( model ! [ respondMessage (Just True) False Nothing (Just <| formatRecords results) model.clientId request ], [] )
+                                                        |> withConnectionManagerModel connectionManagerModel
+                                               )
+
+                                    ListenEvent clientIds ( connectionId, channel, message ) ->
+                                        ( model ! [], [ config.listenEventTagger clientIds ( connectionId, channel, message ) ] )
+                                            |> withConnectionManagerModel connectionManagerModel
+
+                                    Destroyed ->
+                                        ( model ! [], [ config.clientDestroyedTagger model.clientId ] )
+                                            |> withConnectionManagerModel connectionManagerModel
+
+                                    Request proxyRequest request ->
+                                        model.fatalError
+                                            |?> (\error ->
+                                                    ( model ! [ respondError ("Cannot honor request due to previous fatal error:" +-+ error) model.clientId request ], [] )
+                                                        |> withConnectionManagerModel connectionManagerModel
+                                                )
+                                            ?= (case proxyRequest of
+                                                    Connect connectRequest ->
+                                                        ConnectionManager.connect (connectionManagerConfig config) connectRequest model.clientId request connectionManagerModel
+                                                            |> withModel config model
+
+                                                    Disconnect disconnectRequest ->
+                                                        ConnectionManager.disconnect (connectionManagerConfig config) model.clientId disconnectRequest.discardConnection (Just request) connectionManagerModel
+                                                            |> withModel config model
+
+                                                    Query queryRequest ->
                                                         ConnectionManager.isNonListenConnection model.clientId connectionManagerModel
-                                                            ? ( ConnectionManager.listen (connectionManagerConfig config) listenRequest.channel model.clientId request connectionManagerModel
+                                                            ? ( ConnectionManager.getConnectionId model.clientId connectionManagerModel
+                                                                    |?> (\connectionId -> ( model ! [ Postgres.query (PGQueryError request) (PGQuerySuccess request) connectionId queryRequest.sql queryRequest.recordCount ], [] ))
+                                                                    ?= notConnected request model
+                                                              , listeningOnConnection request model
+                                                              )
+                                                            |> withConnectionManagerModel connectionManagerModel
+
+                                                    MoreQueryResults moreQueryResultsRequest ->
+                                                        ConnectionManager.isNonListenConnection model.clientId connectionManagerModel
+                                                            ? ( ConnectionManager.getConnectionId model.clientId connectionManagerModel
+                                                                    |?> (\connectionId -> ( model ! [ Postgres.moreQueryResults (PGQueryError request) (PGQuerySuccess request) connectionId ], [] ))
+                                                                    ?= notConnected request model
+                                                              , listeningOnConnection request model
+                                                              )
+                                                            |> withConnectionManagerModel connectionManagerModel
+
+                                                    ExecuteSql executeSqlRequest ->
+                                                        ConnectionManager.isNonListenConnection model.clientId connectionManagerModel
+                                                            ? ( ConnectionManager.getConnectionId model.clientId connectionManagerModel
+                                                                    |?> (\connectionId -> ( model ! [ Postgres.executeSql (PGExecuteSqlError request) (PGExecuteSqlSuccess request) connectionId executeSqlRequest.sql ], [] ))
+                                                                    ?= notConnected request model
+                                                              , listeningOnConnection request model
+                                                              )
+                                                            |> withConnectionManagerModel connectionManagerModel
+
+                                                    Listen listenRequest ->
+                                                        { model | listenRequest = request }
+                                                            |> (\model ->
+                                                                    ConnectionManager.isNonListenConnection model.clientId connectionManagerModel
+                                                                        ? ( ConnectionManager.listen (connectionManagerConfig config) listenRequest.channel model.clientId request connectionManagerModel
+                                                                                |> withModel config model
+                                                                          , alreadyListeningOnConnection request model
+                                                                                |> withConnectionManagerModel connectionManagerModel
+                                                                          )
+                                                               )
+
+                                                    Unlisten unlistenRequest ->
+                                                        ConnectionManager.isListeningOnChannel model.clientId unlistenRequest.channel connectionManagerModel
+                                                            ? ( ConnectionManager.unlisten (connectionManagerConfig config) unlistenRequest.channel model.clientId request connectionManagerModel
                                                                     |> withModel config model
-                                                              , alreadyListeningOnConnection request model
+                                                              , notListeningToChannel request model
                                                                     |> withConnectionManagerModel connectionManagerModel
                                                               )
-                                                   )
 
-                                        Unlisten unlistenRequest ->
-                                            ConnectionManager.isListeningOnChannel model.clientId unlistenRequest.channel connectionManagerModel
-                                                ? ( ConnectionManager.unlisten (connectionManagerConfig config) unlistenRequest.channel model.clientId request connectionManagerModel
-                                                        |> withModel config model
-                                                  , notListeningToChannel request model
-                                                        |> withConnectionManagerModel connectionManagerModel
-                                                  )
-
-                                        UnknownProxyRequest error ->
-                                            ( model ! [ respondError ("Unknown request: " ++ request ++ " Error: " ++ error) model.clientId request ], [] )
-                                                |> withConnectionManagerModel connectionManagerModel
-                                   )
-               )
+                                                    UnknownProxyRequest error ->
+                                                        ( model ! [ respondError ("Unknown request: " ++ request ++ " Error: " ++ error) model.clientId request ], [] )
+                                                            |> withConnectionManagerModel connectionManagerModel
+                                               )
+                           )
+                )
+           )
 
 
 disconnected : Model -> Time -> Model
 disconnected model time =
-    { model | disconnectedAt = Just time }
+    { model | disconnectedAt = Just time, running = False }
 
 
 disconnectedAt : Model -> Maybe Time
@@ -309,21 +325,24 @@ disconnectedAt model =
     model.disconnectedAt
 
 
-destroyDisconnected : Config msg -> ( Model, ConnectionManager.Model Msg ) -> (Msg -> msg) -> ( ( ( Model, ConnectionManager.Model Msg ), Cmd msg ), List msg )
-destroyDisconnected config ( model, connectionManagerModel ) routeToMeTagger =
-    disconnectedAt model
-        |?> (\_ ->
-                ConnectionManager.getConnectionId model.clientId connectionManagerModel
-                    |?> (\connectionId ->
-                            ConnectionManager.disconnect (destroyedConnectionManagerConfig DisconnectedDestroyed config) model.clientId True (second <| ConnectionManager.getConnectRequestMustExist model.clientId connectionManagerModel) connectionManagerModel
-                                |> withModel config model
-                                |> (\( ( ( model, connectionManagerModel ), cmd ), msgs ) -> ( ( ( model, connectionManagerModel ), Cmd.map routeToMeTagger <| cmd ), msgs ))
-                        )
-                    ?= ( ( model, ConnectionManager.removeClient model.clientId connectionManagerModel ) ! [ Cmd.map routeToMeTagger <| msgToCmd <| Destroyed ]
-                       , []
+destroyDisconnected : Config msg -> ( Model, ConnectionManager.Model Msg ) -> Bool -> (Msg -> msg) -> ( ( ( Model, ConnectionManager.Model Msg ), Cmd msg ), List msg )
+destroyDisconnected config ( model, connectionManagerModel ) force routeToMeTagger =
+    (force ? ( { model | running = False }, model ))
+        |> (\model ->
+                (disconnectedAt model |?> always True ?= force)
+                    ?! ( \_ ->
+                            ConnectionManager.getConnectionId model.clientId connectionManagerModel
+                                |?> (\connectionId ->
+                                        ConnectionManager.disconnect (connectionManagerConfig config) model.clientId True Nothing connectionManagerModel
+                                            |> withModel config model
+                                            |> (\( ( ( model, connectionManagerModel ), cmd ), msgs ) -> ( ( ( model, connectionManagerModel ), Cmd.map routeToMeTagger <| cmd ), msgs ))
+                                    )
+                                ?= ( ( model, ConnectionManager.removeClient model.clientId connectionManagerModel ) ! [ Cmd.map routeToMeTagger <| msgToCmd <| Destroyed ]
+                                   , []
+                                   )
+                       , \_ -> Debug.crash ("BUG: Client was not disconnected (and not forced)" +-+ model)
                        )
-            )
-        ?!= (\_ -> Debug.crash ("BUG: Client was not disconnected" +-+ model))
+           )
 
 
 notify : Config msg -> Model -> (Msg -> msg) -> String -> Cmd msg

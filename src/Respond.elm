@@ -10,7 +10,11 @@ module Respond
 import Json.Decode as JD exposing (..)
 import Websocket exposing (..)
 import Utils.Ops exposing (..)
+import Regex exposing (HowMany(..))
 import Utils.Regex exposing (..)
+
+
+-- import DebugF
 
 
 type alias Request =
@@ -21,12 +25,42 @@ type alias Response =
     String
 
 
+regExEscQuote : Int -> String
+regExEscQuote num =
+    List.range 1 num
+        |> List.map (always "\\\\")
+        |> String.join ""
+        |> (flip (++) "\"")
+
+
+stringEscQuote : Int -> String
+stringEscQuote num =
+    List.range 1 num
+        |> List.map (always "\\")
+        |> String.join ""
+        |> (flip (++) "\"")
+
+
+{-|
+    escaping:
+        " -> \" -> \\\" -> \\\\\\\" -> \\\\\\\\\\\\\\\"
+
+   pattern:
+        total length:   1 -> 2 -> 4 -> 8 -> 16
+        num of escapes: 0 -> 1 -> 3 -> 7 -> 15
+
+N.B this is limited to a JSON encoding of an object that's nested a max of 3 levels deep. To increase this, simply continue the pattern.
+
+-}
 jsonStringEscape : String -> String
 jsonStringEscape string =
     string
+        |> replaceAll (regExEscQuote 7) (stringEscQuote 15)
+        |> replaceAll (regExEscQuote 3) (stringEscQuote 7)
+        |> replaceAll (regExEscQuote 1) (stringEscQuote 3)
+        |> replace All "([^\\\\])\"" (parametricReplacer "$1\\\"")
         |> replaceAll "\\t" "\\\\t"
         |> replaceAll "\\n" "\\\\n"
-        |> replaceAll "\"" "\\\""
 
 
 getRequestId : String -> String
@@ -75,7 +109,7 @@ respondMessage sendErrorTagger sentTagger wsPort maybeSuccess unsolicited maybeK
 
         keyMessage =
             maybeKeyValuePair
-                |?> (\( key, message ) -> (", \"" ++ key ++ "\": \"" ++ (jsonStringEscape message) ++ "\""))
+                |?> (\( key, message ) -> (", \"" ++ key ++ "\": \"" ++ jsonStringEscape message ++ "\""))
                 ?= ""
 
         responseFormatted =

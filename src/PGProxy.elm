@@ -35,10 +35,10 @@ import Utils.Error exposing (..)
 import Utils.Log exposing (..)
 import Utils.Ops exposing (..)
 import Services.Common.Error as Error
-import Services.Common.Taggers exposing (..)
+import Services.Common.Taggers as ServicesCommon exposing (..)
 import Client
 import ConnectionManager
-import DebugF
+import DebugF exposing (..)
 
 
 type alias SharedListenConnection =
@@ -51,7 +51,10 @@ type alias SharedListenConnection =
 {-| Model
 -}
 type alias Model =
-    { running : Bool
+    { version : Int
+    , dumpVersion : Int
+    , running : Bool
+    , stopping : Bool
     , listenError : Bool
     , clients : Dict ClientId Client.Model
     , connectionManagerModel : ConnectionManager.Model Client.Msg
@@ -69,13 +72,18 @@ type alias Config sessionModel msg =
     , path : String
     , delayBeforeStop : Time
     , pgConnectTimeout : Time
-    , errorTagger : ErrorTagger String msg
+    , errorTagger : ServicesCommon.ErrorTagger String msg
     , logTagger : LogTagger String msg
     , startedMsg : Result String () -> msg
     , stoppedMsg : Result String () -> msg
     , garbageCollectDisconnectedClientsAfterPeriod : Time
     , debug : Bool
     , idleDumpStateFrequency : Time
+    , hostMap : Dict String String
+    , portMap : Dict Int Int
+    , databaseMap : Dict String String
+    , userMap : Dict String String
+    , passwordMap : Dict String String
     }
 
 
@@ -98,6 +106,7 @@ clientConfig config =
     , sentTagger = Sent
     , clientDestroyedTagger = ClientDestroyed
     , listenEventTagger = ListenEvent
+    , debug = config.debug
     }
 
 
@@ -105,7 +114,10 @@ clientConfig config =
 -}
 init : Config sessionModel msg -> (Msg -> msg) -> ( ( Model, Cmd msg ), Msg, Msg )
 init config tagger =
-    ( { running = False
+    ( { version = 0
+      , dumpVersion = -1
+      , running = False
+      , stopping = False
       , listenError = False
       , clients = Dict.empty
       , connectionManagerModel = ConnectionManager.init
@@ -158,234 +170,267 @@ type Msg
 -}
 update : Config sessionModel msg -> Msg -> ( Model, sessionModel ) -> ( ( ( Model, sessionModel ), Cmd Msg ), List msg )
 update config msg ( model, sessionModel ) =
-    let
-        withSessionModel sessionModel ( ( model, cmd ), msgs ) =
-            ( ( ( model, sessionModel ), cmd ), msgs )
+    (case msg of
+        Tick _ ->
+            model
 
-        debugMsg =
-            case msg of
-                Tick _ ->
-                    msg
+        _ ->
+            { model | version = model.version + 1 }
+    )
+        |> (\model ->
+                let
+                    debugMsg =
+                        case msg of
+                            Tick _ ->
+                                ""
 
-                ClientLog _ ->
-                    msg
+                            ClientLog _ ->
+                                ""
 
-                ClientError _ ->
-                    msg
+                            ClientError _ ->
+                                ""
 
-                _ ->
-                    config.debug ? ( Debug.log "*** DEBUG:PGProxy msg" msg, msg )
+                            _ ->
+                                config.debug ? ( DebugF.logFC Cyan Black "*** DEBUG:PGProxy msg" (cleanElmString <| toString msg), "" )
+                in
+                    let
+                        withSessionModel sessionModel ( ( model, cmd ), msgs ) =
+                            ( ( ( model, sessionModel ), cmd ), msgs )
 
-        destroyClients model clientIdAndModels =
-            clientIdAndModels
-                |> List.foldl
-                    (\( clientId, clientModel ) ( ( model, connectionManagerModel ), cmds, previousMsgs ) ->
-                        Client.destroyDisconnected (clientConfig config) ( clientModel, connectionManagerModel ) (ClientMsg clientId)
-                            |> (\( ( ( clientModel, connectionManagerModel ), cmd ), msgs ) -> ( ( { model | clients = Dict.insert clientId clientModel model.clients }, connectionManagerModel ), cmd :: cmds, List.append previousMsgs msgs ))
-                    )
-                    ( ( model, model.connectionManagerModel ), [], [] )
-                |> (\( ( model, connectionManagerModel ), cmds, myMsgs ) ->
-                        { model | connectionManagerModel = connectionManagerModel }
-                            |> (\model ->
-                                    myMsgs
-                                        |> List.foldl
-                                            (\msg ( ( model, sessionModel ), cmds, previousMsgs ) ->
-                                                update config msg ( model, sessionModel )
-                                                    |> (\( ( ( model, sessionModel ), cmd ), msgs ) -> ( ( model, sessionModel ), cmd :: cmds, List.append previousMsgs msgs ))
-                                            )
-                                            ( ( model, sessionModel ), cmds, [] )
-                                        |> (\( ( model, sessionModel ), cmds, msgs ) -> ( ( model, sessionModel ) ! cmds, msgs ))
-                               )
-                   )
-
-        updateClient clientId clientModel =
-            updateChildParent (Client.update (clientConfig config))
-                (update config)
-                (\( model, _ ) -> ( clientModel, model.connectionManagerModel ))
-                (ClientMsg clientId)
-                (\( model, sessionModel ) ( clientModel, connectionManagerModel ) -> ( { model | clients = Dict.insert clientId clientModel model.clients, connectionManagerModel = connectionManagerModel }, sessionModel ))
-
-        debugDumpState model =
-            config.debug
-                ? ( (DebugF.toStringF model)
-                        |> cleanElmString
-                        |> DebugF.log "*** DEBUG:PGProxy model"
-                  , ""
-                  )
-
-        debugDumpAllStates model =
-            config.debug
-                ? ( debugDumpState model
-                        |> (always Postgres.dumpState)
-                  , Cmd.none
-                  )
-    in
-        (case msg of
-            Tick _ ->
-                { model | idleTime = model.idleTime + tickPeriod }
-
-            _ ->
-                { model | idleTime = 0 }
-        )
-            |> (\model ->
-                    case msg of
-                        Tick time ->
-                            { model | currentTime = time }
-                                |> (\model ->
-                                        (((model.idleTime >= config.idleDumpStateFrequency) ?! ( \_ -> ( { model | idleTime = 0 }, debugDumpAllStates model ), \_ -> ( model, Cmd.none ) ))
-                                            |> (\( model, cmd ) -> ( model ! [ cmd ], [] ))
-                                            |> withSessionModel sessionModel
-                                        )
-                                            |> (\( ( ( model, sessionModel ), dumpCmd ), dumpMsgs ) ->
-                                                    model.clients
-                                                        |> Dict.toList
-                                                        |> List.filterMap (\( clientId, clientModel ) -> Client.disconnectedAt clientModel |?> (\disconnectedAt -> ( clientId, disconnectedAt )))
-                                                        |> (List.foldl
-                                                                (\( clientId, disconnectedAt ) ( model, cmds ) ->
-                                                                    (time - disconnectedAt >= config.garbageCollectDisconnectedClientsAfterPeriod)
-                                                                        ? ( ( model, (msgToCmd <| ClientDestroyed clientId) :: cmds )
-                                                                          , ( model, [] )
-                                                                          )
-                                                                )
-                                                                ( model, [ dumpCmd ] )
-                                                           )
-                                                        |> (\( model, cmds ) -> ( (( model, sessionModel ) ! cmds), dumpMsgs ))
-                                               )
+                        destroyClients model force clientIdAndModels =
+                            clientIdAndModels
+                                |> List.foldl
+                                    (\( clientId, clientModel ) ( model, cmds, previousMsgs ) ->
+                                        Client.destroyDisconnected (clientConfig config) ( clientModel, model.connectionManagerModel ) force (ClientMsg clientId)
+                                            |> (\( ( ( clientModel, connectionManagerModel ), cmd ), msgs ) -> ( { model | clients = Dict.insert clientId clientModel model.clients, connectionManagerModel = connectionManagerModel }, cmd :: cmds, List.append previousMsgs msgs ))
+                                    )
+                                    ( model, [], [] )
+                                |> (\( model, cmds, myMsgs ) ->
+                                        myMsgs
+                                            |> List.foldl
+                                                (\msg ( ( model, sessionModel ), cmds, previousMsgs ) ->
+                                                    update config msg ( model, sessionModel )
+                                                        |> (\( ( ( model, sessionModel ), cmd ), msgs ) -> ( ( model, sessionModel ), cmd :: cmds, List.append previousMsgs msgs ))
+                                                )
+                                                ( ( model, sessionModel ), cmds, [] )
+                                            |> (\( ( model, sessionModel ), cmds, msgs ) -> ( ( model, sessionModel ) ! cmds, msgs ))
                                    )
 
-                        Start ->
-                            ( { model | running = True } ! [], [ config.startedMsg <| Ok () ] )
-                                |> withSessionModel sessionModel
+                        updateClient clientId clientModel =
+                            updateChildParent (Client.update (clientConfig config))
+                                (update config)
+                                (\( model, _ ) -> ( clientModel, model.connectionManagerModel ))
+                                (ClientMsg clientId)
+                                (\( model, sessionModel ) ( clientModel, connectionManagerModel ) -> ( { model | clients = Dict.insert clientId clientModel model.clients, connectionManagerModel = connectionManagerModel }, sessionModel ))
 
-                        Stop ->
-                            ( { model | running = False } ! [ delayMsg DelayedStop config.delayBeforeStop ], [] )
-                                |> withSessionModel sessionModel
-
-                        DelayedStop ->
-                            Dict.toList model.clients
-                                |> (\clientIdAndModels ->
-                                        (clientIdAndModels == [])
-                                            ?! ( (\_ -> update config Stopped ( model, sessionModel ))
-                                               , (\_ ->
-                                                    clientIdAndModels
-                                                        |> List.map (Tuple.mapSecond (\clientModel -> Client.disconnected clientModel model.currentTime))
-                                                        |> destroyClients model
-                                                 )
-                                               )
-                                   )
-
-                        ClientDestroyed clientId ->
-                            { model | clients = Dict.remove clientId model.clients }
-                                |> (\model ->
-                                        (Dict.toList model.clients == [] && not model.running)
-                                            ?! ( (\_ -> update config Stopped ( model, sessionModel ))
-                                               , (\_ -> ( ( model, sessionModel ) ! [], [] ))
-                                               )
-                                   )
-
-                        Stopped ->
-                            ( model ! [], [ config.stoppedMsg <| Ok () ] )
-                                |> withSessionModel sessionModel
-                                |> (\( ( ( model, sessionModel ), cmd ), msgs ) -> ( ( model, sessionModel ) ! [ debugDumpAllStates model, cmd ], msgs ))
-
-                        ConnectionStatus ( wsPort, path, clientId, ipAddress, status ) ->
-                            config.logTagger ( LogLevelDebug, String.join " " [ toString status, "from ipAddress: ", ipAddress, " on port: ", toString wsPort, " on path: ", toString path, " for clientId: ", toString clientId ] )
-                                |> (\logMsg ->
-                                        case status of
-                                            Connected ->
-                                                ( { model | clients = Dict.insert clientId (Client.init clientId) model.clients } ! [], [ logMsg ] )
-                                                    |> withSessionModel sessionModel
-
-                                            Disconnected ->
-                                                getClientModel clientId model
-                                                    |?> (\clientModel ->
-                                                            model.clients
-                                                                |> Dict.filter (\dictClientId _ -> dictClientId == clientId)
-                                                                |> Dict.toList
-                                                                |> List.map (Tuple.mapSecond (\clientModel -> Client.disconnected clientModel model.currentTime))
-                                                                |> destroyClients model
-                                                                |> (\( ( ( model, sessionModel ), cmd ), msgs ) -> ( ( model, sessionModel ) ! [ cmd ], List.append [ logMsg ] msgs ))
-                                                        )
-                                                    ?= ( ( model, sessionModel ) ! [], [] )
-                                   )
-
-                        ClientError ( errorType, error ) ->
-                            ( model ! [], [ config.errorTagger ( errorType, "Client:" +-+ error ) ] )
-                                |> withSessionModel sessionModel
-
-                        ClientLog ( logLevel, message ) ->
-                            ( model ! [], [ config.logTagger ( logLevel, "Client:" +-+ message ) ] )
-                                |> withSessionModel sessionModel
-
-                        ListenError ( wsPort, path, error ) ->
-                            ( { model | listenError = True } ! [], [ config.errorTagger ( FatalError, ("Unable to listen to websocket on port:" +-+ wsPort +-+ "for path:" +-+ path +-+ "error:" +-+ error) ) ] )
-                                |> withSessionModel sessionModel
-
-                        SendError ( wsPort, clientId, message, error ) ->
-                            ("Unable to send:" +-+ message +-+ "to websocket on port:" +-+ wsPort +-+ "for clientId:" +-+ clientId +-+ "error:" +-+ error)
-                                |> (\errorMsg ->
-                                        ( model ! [], [ config.errorTagger ( NonFatalError, errorMsg ) ] )
-                                            |> withSessionModel sessionModel
-                                   )
-
-                        Sent ( wsPort, clientId, message ) ->
-                            (config.debug ? ( Debug.log "*** DEBUG:PGProxy <--- SENT ---<<<" ( clientId, message ), ( clientId, message ) ))
-                                |> always (( model ! [], [] ) |> withSessionModel sessionModel)
-
-                        WSMessage ( clientId, _, request ) ->
-                            model.running
-                                ? ( (config.debug ? ( Debug.log "*** DEBUG:PGProxy >>>- RECEIVED --->" ( clientId, request ), ( clientId, request ) ))
-                                        |> always
-                                            (decodeRequest request
-                                                |> (\( type_, decodeResult ) ->
-                                                        ( decodeResult ??= (\err -> UnknownProxyRequest err), Dict.get clientId model.clients )
-                                                            |> (\( proxyRequest, maybeClientModel ) ->
-                                                                    maybeClientModel
-                                                                        |?> (\clientModel ->
-                                                                                (config.authenticate sessionModel <| getSessionId request)
-                                                                                    |> (\( sessionModel, authenticated ) ->
-                                                                                            authenticated
-                                                                                                ? ( getClientModel clientId model
-                                                                                                        |?> (\clientModel -> updateClient clientId clientModel (Client.Request proxyRequest request) ( model, sessionModel ))
-                                                                                                        ?= (( model ! [], [] ) |> withSessionModel sessionModel)
-                                                                                                  , (( model ! [ respondError SendError Sent config.wsPort Error.invalidSession clientId request ], [] )
-                                                                                                        |> withSessionModel sessionModel
-                                                                                                    )
-                                                                                                  )
-                                                                                       )
-                                                                            )
-                                                                        ?= (( model ! [ respondError SendError Sent config.wsPort Error.invalidSession clientId request ], [] )
-                                                                                |> withSessionModel sessionModel
-                                                                           )
-                                                               )
-                                                   )
-                                            )
-                                  , ( model ! [], [ config.logTagger ( LogLevelInfo, "Ignoring request:" +-+ request +-+ "since shutting down" ) ] )
-                                        |> withSessionModel sessionModel
+                        debugDumpState model =
+                            (config.debug && model.version /= model.dumpVersion)
+                                ? ( (DebugF.toStringF model)
+                                        |> cleanElmString
+                                        |> DebugF.log "*** DEBUG:PGProxy model"
+                                  , ""
                                   )
 
-                        ListenEvent clientIds ( connectionId, channel, message ) ->
-                            clientIds
-                                |> List.filterMap
-                                    (\clientId ->
-                                        getClientModel clientId model
-                                            |?> (\clientModel -> Just ( clientId, clientModel ))
-                                            ?= Nothing
-                                    )
-                                |> List.map (\( clientId, clientModel ) -> Client.notify (clientConfig config) clientModel (ClientMsg clientId) message)
-                                |> (\cmds -> ( model ! cmds, [] ))
-                                |> withSessionModel sessionModel
-
-                        ClientMsg clientId msg ->
-                            getClientModel clientId model
-                                |?> (\clientModel -> updateClient clientId clientModel msg ( model, sessionModel ))
-                                ?= (ConnectionManager.removeClient clientId model.connectionManagerModel
-                                        |> (\connectionManagerModel ->
-                                                ( { model | connectionManagerModel = connectionManagerModel } ! [], [ config.logTagger ( LogLevelInfo, "Ignoring message for non-existent clientId:" +-+ clientId ) ] )
-                                                    |> withSessionModel sessionModel
-                                           )
+                        debugDumpAllStates model =
+                            (config.debug && model.version /= model.dumpVersion)
+                                ?! ( \_ ->
+                                        debugDumpState model
+                                            |> (always Postgres.dumpState)
+                                   , always Cmd.none
                                    )
-               )
+                                |> (\cmd -> ( { model | dumpVersion = model.version }, cmd ))
+                    in
+                        (case msg of
+                            Tick _ ->
+                                { model | idleTime = model.idleTime + tickPeriod }
+
+                            _ ->
+                                { model | idleTime = 0 }
+                        )
+                            |> (\model ->
+                                    case msg of
+                                        Tick time ->
+                                            { model | currentTime = time }
+                                                |> (\model ->
+                                                        (((model.idleTime >= config.idleDumpStateFrequency) ?! ( \_ -> debugDumpAllStates { model | idleTime = 0 }, \_ -> ( model, Cmd.none ) ))
+                                                            |> (\( model, cmd ) -> ( model ! [ cmd ], [] ))
+                                                            |> withSessionModel sessionModel
+                                                        )
+                                                            |> (\( ( ( model, sessionModel ), dumpCmd ), dumpMsgs ) ->
+                                                                    model.clients
+                                                                        |> Dict.toList
+                                                                        |> List.filterMap (\( clientId, clientModel ) -> Client.disconnectedAt clientModel |?> (\disconnectedAt -> ( clientId, disconnectedAt )))
+                                                                        |> (List.foldl
+                                                                                (\( clientId, disconnectedAt ) ( model, cmds ) ->
+                                                                                    (time - disconnectedAt >= config.garbageCollectDisconnectedClientsAfterPeriod)
+                                                                                        ? ( ( model, (msgToCmd <| ClientDestroyed clientId) :: cmds )
+                                                                                          , ( model, [] )
+                                                                                          )
+                                                                                )
+                                                                                ( model, [ dumpCmd ] )
+                                                                           )
+                                                                        |> (\( model, cmds ) -> ( (( model, sessionModel ) ! cmds), dumpMsgs ))
+                                                               )
+                                                   )
+
+                                        Start ->
+                                            ( { model | running = True } ! [], [ config.startedMsg <| Ok () ] )
+                                                |> withSessionModel sessionModel
+
+                                        Stop ->
+                                            model.clients
+                                                |> Dict.map (\clientId clientModel -> Client.stop clientModel)
+                                                |> (\clients -> { model | clients = clients })
+                                                |> (\model ->
+                                                        ConnectionManager.stop model.connectionManagerModel
+                                                            |> (\connectionManagerModel -> { model | connectionManagerModel = connectionManagerModel })
+                                                            |> (\model ->
+                                                                    ( { model | running = False, stopping = True } ! [ delayMsg DelayedStop config.delayBeforeStop ], [] )
+                                                                        |> withSessionModel sessionModel
+                                                               )
+                                                   )
+
+                                        DelayedStop ->
+                                            Dict.toList model.clients
+                                                |> (\clientIdAndModels ->
+                                                        (clientIdAndModels == [])
+                                                            ?! ( (\_ -> update config Stopped ( model, sessionModel ))
+                                                               , (\_ ->
+                                                                    clientIdAndModels
+                                                                        |> List.map (Tuple.mapSecond (\clientModel -> Client.disconnected clientModel model.currentTime))
+                                                                        |> destroyClients model True
+                                                                 )
+                                                               )
+                                                   )
+
+                                        ClientDestroyed clientId ->
+                                            { model | clients = Dict.remove clientId model.clients }
+                                                |> (\model ->
+                                                        (Dict.toList model.clients == [] && not model.running)
+                                                            ?! ( (\_ -> update config Stopped ( model, sessionModel ))
+                                                               , (\_ -> ( ( model, sessionModel ) ! [], [] ))
+                                                               )
+                                                   )
+
+                                        Stopped ->
+                                            ( model ! [], [ config.stoppedMsg <| Ok () ] )
+                                                |> withSessionModel sessionModel
+                                                |> (\( ( ( model, sessionModel ), cmd ), msgs ) ->
+                                                        debugDumpAllStates model
+                                                            |> (\( model, cmd ) -> ( ( model, sessionModel ) ! [ cmd ], msgs ))
+                                                   )
+
+                                        ConnectionStatus ( wsPort, path, clientId, ipAddress, status ) ->
+                                            config.logTagger ( LogLevelDebug, String.join " " [ toString status, "from ipAddress: ", ipAddress, " on port: ", toString wsPort, " on path: ", toString path, " for clientId: ", toString clientId ] )
+                                                |> (\logMsg ->
+                                                        case status of
+                                                            Connected ->
+                                                                ( { model | clients = Dict.insert clientId (Client.init clientId) model.clients } ! [], [ logMsg ] )
+                                                                    |> withSessionModel sessionModel
+
+                                                            Disconnected ->
+                                                                getClientModel clientId model
+                                                                    |?> (\clientModel ->
+                                                                            model.clients
+                                                                                |> Dict.filter (\dictClientId _ -> dictClientId == clientId)
+                                                                                |> Dict.toList
+                                                                                |> List.map (Tuple.mapSecond (\clientModel -> Client.disconnected clientModel model.currentTime))
+                                                                                |> destroyClients model False
+                                                                        )
+                                                                    ?= ( ( model, sessionModel ) ! [], [] )
+                                                   )
+
+                                        ClientError ( errorType, error ) ->
+                                            ( model ! [], [ config.errorTagger ( errorType, "Client:" +-+ error ) ] )
+                                                |> withSessionModel sessionModel
+
+                                        ClientLog ( logLevel, message ) ->
+                                            ( model ! [], [ config.logTagger ( logLevel, "Client:" +-+ message ) ] )
+                                                |> withSessionModel sessionModel
+
+                                        ListenError ( wsPort, path, error ) ->
+                                            ( { model | listenError = True } ! [], [ config.errorTagger ( FatalError, ("Unable to listen to websocket on port:" +-+ wsPort +-+ "for path:" +-+ path +-+ "error:" +-+ error) ) ] )
+                                                |> withSessionModel sessionModel
+
+                                        SendError ( wsPort, clientId, message, error ) ->
+                                            ("Unable to send:" +-+ message +-+ "to websocket on port:" +-+ wsPort +-+ "for clientId:" +-+ clientId +-+ "error:" +-+ error)
+                                                |> (\errorMsg ->
+                                                        ( model ! [], [ config.errorTagger ( NonFatalError, errorMsg ) ] )
+                                                            |> withSessionModel sessionModel
+                                                   )
+
+                                        Sent ( wsPort, clientId, message ) ->
+                                            ( model ! [], [] )
+                                                |> withSessionModel sessionModel
+
+                                        WSMessage ( clientId, _, request ) ->
+                                            not model.stopping
+                                                ? ( decodeRequest request
+                                                        |> (\( type_, decodeResult ) ->
+                                                                ( decodeResult ??= (\err -> UnknownProxyRequest err), Dict.get clientId model.clients )
+                                                                    |> (\( unmappedProxyRequest, maybeClientModel ) ->
+                                                                            (case unmappedProxyRequest of
+                                                                                Connect request ->
+                                                                                    Connect
+                                                                                        { request
+                                                                                            | host = Dict.get request.host config.hostMap ?= "invalid"
+                                                                                            , port_ = Dict.get request.port_ config.portMap ?= 0
+                                                                                            , database = Dict.get request.database config.databaseMap ?= "invalid"
+                                                                                            , user = Dict.get request.user config.userMap ?= "invalid"
+                                                                                            , password = Dict.get request.password config.passwordMap ?= "invalid"
+                                                                                        }
+
+                                                                                _ ->
+                                                                                    unmappedProxyRequest
+                                                                            )
+                                                                                |> (\proxyRequest ->
+                                                                                        maybeClientModel
+                                                                                            |?> (\clientModel ->
+                                                                                                    (config.authenticate sessionModel <| getSessionId request)
+                                                                                                        |> (\( sessionModel, authenticated ) ->
+                                                                                                                authenticated
+                                                                                                                    ? ( getClientModel clientId model
+                                                                                                                            |?> (\clientModel -> updateClient clientId clientModel (Client.Request proxyRequest request) ( model, sessionModel ))
+                                                                                                                            ?= (( model ! [], [] ) |> withSessionModel sessionModel)
+                                                                                                                      , (( model ! [ respondError SendError Sent config.wsPort Error.invalidSession clientId request ], [] )
+                                                                                                                            |> withSessionModel sessionModel
+                                                                                                                        )
+                                                                                                                      )
+                                                                                                           )
+                                                                                                )
+                                                                                            ?= (( model ! [ respondError SendError Sent config.wsPort Error.invalidSession clientId request ], [] )
+                                                                                                    |> withSessionModel sessionModel
+                                                                                               )
+                                                                                   )
+                                                                       )
+                                                           )
+                                                  , ( model ! [], [ config.logTagger ( LogLevelInfo, "Ignoring request:" +-+ request +-+ "since shutting down" ) ] )
+                                                        |> withSessionModel sessionModel
+                                                  )
+
+                                        ListenEvent clientIds ( connectionId, channel, message ) ->
+                                            clientIds
+                                                |> List.filterMap
+                                                    (\clientId ->
+                                                        getClientModel clientId model
+                                                            |?> (\clientModel -> Just ( clientId, clientModel ))
+                                                            ?= Nothing
+                                                    )
+                                                |> List.map (\( clientId, clientModel ) -> Client.notify (clientConfig config) clientModel (ClientMsg clientId) message)
+                                                |> (\cmds -> ( model ! cmds, [] ))
+                                                |> withSessionModel sessionModel
+
+                                        ClientMsg clientId msg ->
+                                            getClientModel clientId model
+                                                |?> (\clientModel -> updateClient clientId clientModel msg ( model, sessionModel ))
+                                                ?= (ConnectionManager.removeClient clientId model.connectionManagerModel
+                                                        |> (\connectionManagerModel ->
+                                                                ( { model | connectionManagerModel = connectionManagerModel } ! [], [ config.logTagger ( LogLevelInfo, "Ignoring message for non-existent clientId:" +-+ clientId ) ] )
+                                                                    |> withSessionModel sessionModel
+                                                           )
+                                                   )
+                               )
+           )
 
 
 getSessionId : String -> SessionId
