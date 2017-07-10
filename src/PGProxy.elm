@@ -197,7 +197,7 @@ update config msg ( model, sessionModel ) =
                         withSessionModel sessionModel ( ( model, cmd ), msgs ) =
                             ( ( ( model, sessionModel ), cmd ), msgs )
 
-                        destroyClients model force clientIdAndModels =
+                        destroyClients model sessionModel force clientIdAndModels =
                             clientIdAndModels
                                 |> List.foldl
                                     (\( clientId, clientModel ) ( model, cmds, previousMsgs ) ->
@@ -259,17 +259,19 @@ update config msg ( model, sessionModel ) =
                                                             |> (\( ( ( model, sessionModel ), dumpCmd ), dumpMsgs ) ->
                                                                     model.clients
                                                                         |> Dict.toList
-                                                                        |> List.filterMap (\( clientId, clientModel ) -> Client.disconnectedAt clientModel |?> (\disconnectedAt -> ( clientId, disconnectedAt )))
+                                                                        |> List.filterMap (\( clientId, clientModel ) -> Client.disconnectedAt clientModel |?> (\disconnectedAt -> ( clientId, clientModel, disconnectedAt )))
                                                                         |> (List.foldl
-                                                                                (\( clientId, disconnectedAt ) ( model, cmds ) ->
+                                                                                (\( clientId, clientModel, disconnectedAt ) ( ( model, sessionModel ), cmds, msgs ) ->
                                                                                     (time - disconnectedAt >= config.garbageCollectDisconnectedClientsAfterPeriod)
-                                                                                        ? ( ( model, (msgToCmd <| ClientDestroyed clientId) :: cmds )
-                                                                                          , ( model, [] )
-                                                                                          )
+                                                                                        ?! ( \_ ->
+                                                                                                destroyClients model sessionModel False [ ( clientId, clientModel ) ]
+                                                                                                    |> (\( ( ( model, sessionModel ), cmd ), destroyMsgs ) -> ( ( model, sessionModel ), cmd :: cmds, List.append destroyMsgs msgs ))
+                                                                                           , always ( ( model, sessionModel ), [], [] )
+                                                                                           )
                                                                                 )
-                                                                                ( model, [ dumpCmd ] )
+                                                                                ( ( model, sessionModel ), [ dumpCmd ], dumpMsgs )
                                                                            )
-                                                                        |> (\( model, cmds ) -> ( (( model, sessionModel ) ! cmds), dumpMsgs ))
+                                                                        |> (\( ( model, sessionModel ), cmds, msgs ) -> ( (( model, sessionModel ) ! cmds), msgs ))
                                                                )
                                                    )
 
@@ -298,7 +300,7 @@ update config msg ( model, sessionModel ) =
                                                                , (\_ ->
                                                                     clientIdAndModels
                                                                         |> List.map (Tuple.mapSecond (\clientModel -> Client.disconnected clientModel model.currentTime))
-                                                                        |> destroyClients model True
+                                                                        |> destroyClients model sessionModel True
                                                                  )
                                                                )
                                                    )
@@ -321,7 +323,7 @@ update config msg ( model, sessionModel ) =
                                                    )
 
                                         ConnectionStatus ( wsPort, path, clientId, ipAddress, status ) ->
-                                            config.logTagger ( LogLevelDebug, String.join " " [ toString status, "from ipAddress: ", ipAddress, " on port: ", toString wsPort, " on path: ", toString path, " for clientId: ", toString clientId ] )
+                                            config.logTagger ( LogLevelDebug, String.join " " [ toString status, "from ipAddress:", ipAddress, " on port:", toString wsPort, " on path:", toString path, " for clientId:", toString clientId ] )
                                                 |> (\logMsg ->
                                                         case status of
                                                             Connected ->
@@ -332,10 +334,10 @@ update config msg ( model, sessionModel ) =
                                                                 getClientModel clientId model
                                                                     |?> (\clientModel ->
                                                                             model.clients
-                                                                                |> Dict.filter (\dictClientId _ -> dictClientId == clientId)
+                                                                                |> Dict.filter (\dictClientId clientModel -> dictClientId == clientId)
                                                                                 |> Dict.toList
                                                                                 |> List.map (Tuple.mapSecond (\clientModel -> Client.disconnected clientModel model.currentTime))
-                                                                                |> destroyClients model False
+                                                                                |> destroyClients model sessionModel False
                                                                         )
                                                                     ?= ( ( model, sessionModel ) ! [], [] )
                                                    )
@@ -421,14 +423,8 @@ update config msg ( model, sessionModel ) =
                                                 |> withSessionModel sessionModel
 
                                         ClientMsg clientId msg ->
-                                            getClientModel clientId model
-                                                |?> (\clientModel -> updateClient clientId clientModel msg ( model, sessionModel ))
-                                                ?= (ConnectionManager.removeClient clientId model.connectionManagerModel
-                                                        |> (\connectionManagerModel ->
-                                                                ( { model | connectionManagerModel = connectionManagerModel } ! [], [ config.logTagger ( LogLevelInfo, "Ignoring message for non-existent clientId:" +-+ clientId ) ] )
-                                                                    |> withSessionModel sessionModel
-                                                           )
-                                                   )
+                                            (getClientModel clientId model ?= Client.disconnected (Client.init clientId) model.currentTime)
+                                                |> (\clientModel -> updateClient clientId clientModel msg ( model, sessionModel ))
                                )
            )
 

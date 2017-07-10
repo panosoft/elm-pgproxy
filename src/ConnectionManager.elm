@@ -123,7 +123,7 @@ update config msg model =
                                     Dict.get clientId model.connectRequests
                                         |?> (\_ -> ( createConnection clientId connectionId model ! [], [ config.logTagger ( LogLevelDebug, "Created New Connection:" +-+ ( clientId, connectionId ) ), config.connectedTagger request ] ))
                                         ?= (disconnectInternal config clientId connectionId True (Just request) model
-                                                |> (\( ( model, cmd ), msgs ) -> ( model ! [ cmd ], List.append msgs [ config.logTagger ( LogLevelDebug, "DESTROYED NewConnection:" +-+ ( clientId, connectionId ) ) ] ))
+                                                |> (\( ( model, cmd ), msgs ) -> ( model ! [ cmd ], List.append msgs [ config.logTagger ( LogLevelDebug, "DESTROYED New Connection:" +-+ ( clientId, connectionId ) ) ] ))
                                            )
 
                                 ConnectionLost request ( connectionId, error ) ->
@@ -239,8 +239,8 @@ reconnectCommon reconnectCallback config channel clientId listenUnlistenRequest 
 
 disconnectInternal : Config msg -> ClientId -> ConnectionId -> Bool -> Maybe Request -> Model msg -> ( ( Model msg, Cmd Msg ), List msg )
 disconnectInternal config clientId connectionId discardConnection maybeRequest model =
-    (List.length (getSharedClientIds clientId model) == 1)
-        ? ( ( model ! [ Postgres.disconnect (DisconnectError maybeRequest) (Disconnected maybeRequest) connectionId discardConnection ], [ config.logTagger ( LogLevelDebug, "Disconnect LAST, ClientId:" +-+ clientId ) ] )
+    (List.length (getSharedClientIds clientId model) <= 1)
+        ? ( ( model ! [ Postgres.disconnect (DisconnectError maybeRequest) (Disconnected maybeRequest) connectionId discardConnection ], [ config.logTagger ( LogLevelDebug, "Disconnect LAST, ClientId:" +-+ clientId +-+ "ConnectionId:" +-+ connectionId ) ] )
           , ( { model
                 | connectRequests = Dict.remove clientId model.connectRequests
                 , connectionIds = Dict.remove clientId model.connectionIds
