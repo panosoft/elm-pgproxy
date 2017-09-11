@@ -1,5 +1,6 @@
 port module Test.App exposing (..)
 
+import Dict exposing (Dict)
 import Platform
 import Time
 import String exposing (..)
@@ -80,6 +81,11 @@ pgProxyConfig =
     , garbageCollectDisconnectedClientsAfterPeriod = 5 * Time.second
     , debug = True
     , idleDumpStateFrequency = 5 * Time.second
+    , hostMap = Dict.empty
+    , portMap = Dict.empty
+    , databaseMap = Dict.empty
+    , userMap = Dict.empty
+    , passwordMap = Dict.empty
     }
 
 
