@@ -5,8 +5,8 @@
   "author": "Charles Scalfani",
   "license": "Unlicense",
   "dependencies": {
-    "@panosoft/elm-postgres": "/Users/charles/Documents/workspace/elm/panosoft/elm-pgproxy/elm-stuff/packages/panosoft/elm-postgres/4.2.0",
-    "@panosoft/elm-websocket-server": "/Users/charles/Documents/workspace/elm/panosoft/elm-pgproxy/elm-stuff/packages/panosoft/elm-websocket-server/4.0.0"
+    "@panosoft/elm-postgres": "elm-stuff/grove/packages/panosoft/elm-postgres/installed",
+    "@panosoft/elm-websocket-server": "elm-stuff/grove/packages/panosoft/elm-websocket-server/installed"
   },
   "devDependencies": {}
 }
