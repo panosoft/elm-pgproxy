@@ -1,5 +1,5 @@
 {
-    "version": "5.0.1",
+    "version": "5.0.2",
     "summary": "Proxy Service for PostGres Effect Manager",
     "repository": "https://github.com/panosoft/elm-pgproxy.git",
     "license": "Unlicense",
